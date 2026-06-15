@@ -92,14 +92,14 @@ def parse_fs_doc(doc: dict) -> dict:
 
 # ─── Video analysis with Claude Vision ───────────────────────────────────────
 
-def extract_frames(video_url: str, num_frames: int = 4) -> list[str]:
+def extract_frames(video_url: str, num_frames: int = 4, extra_headers: dict = {}) -> list[str]:
     """Download video and extract frames as base64 images using FFmpeg."""
     frames = []
     with tempfile.TemporaryDirectory() as tmp:
         video_path = os.path.join(tmp, "video.mp4")
 
-        # Download video
-        r = requests.get(video_url, stream=True, timeout=30)
+        # Download video (with optional auth headers for Google Drive)
+        r = requests.get(video_url, stream=True, timeout=60, headers=extra_headers)
         with open(video_path, "wb") as f:
             for chunk in r.iter_content(chunk_size=8192):
                 f.write(chunk)
@@ -233,6 +233,7 @@ def analyse_video(req: AnalyseVideoRequest):
 
 class ScanDriveRequest(BaseModel):
     client_id: str  # clientId field in Firestore (e.g. "ilai")
+    google_access_token: Optional[str] = None
 
 @app.post("/scan-drive")
 def scan_drive(req: ScanDriveRequest):
@@ -275,14 +276,26 @@ def scan_drive(req: ScanDriveRequest):
             if clip.get("aiAnalysedAt"):
                 continue
             clip_id = doc["name"].split("/")[-1]
-            video_url = clip.get("driveUrl") or clip.get("bunnyUrl") or clip.get("downloadUrl")
+
+            # Build video URL — prefer Bunny CDN (no auth needed), fall back to Drive API
+            video_url = clip.get("bunnyUrl") or clip.get("driveUrl") or clip.get("downloadUrl")
+            drive_file_id = clip.get("driveFileId")
+
+            # If no direct URL but we have a Drive file ID + token, use Drive API
+            if not video_url and drive_file_id and req.google_access_token:
+                video_url = f"https://www.googleapis.com/drive/v3/files/{drive_file_id}?alt=media"
 
             if not video_url:
                 errors.append({"clip_id": clip_id, "error": "No video URL"})
                 continue
 
+            # Build headers for download (Drive API needs auth)
+            download_headers = {}
+            if "googleapis.com" in video_url and req.google_access_token:
+                download_headers["Authorization"] = f"Bearer {req.google_access_token}"
+
             try:
-                frames = extract_frames(video_url, num_frames=4)
+                frames = extract_frames(video_url, num_frames=4, extra_headers=download_headers)
                 if frames:
                     analysis = analyse_video_with_claude(frames, clip.get("caption", ""), niche)
                     firestore_patch(f"clips/{clip_id}", {
