@@ -136,7 +136,7 @@ def extract_frames(video_url: str, num_frames: int = 4, extra_headers: dict = {}
 
     return frames
 
-def analyse_video_with_claude(frames: list[str], caption: str = "", niche: str = "") -> dict:
+def analyse_video_with_claude(frames: list[str], caption: str = "", niche: str = "", taxonomy: dict = None) -> dict:
     """Send frames to Claude Vision for content analysis."""
     if not frames:
         return {"error": "No frames extracted"}
@@ -154,10 +154,22 @@ def analyse_video_with_claude(frames: list[str], caption: str = "", niche: str =
             "source": {"type": "base64", "media_type": "image/jpeg", "data": frame_b64}
         })
 
+    # Build taxonomy hint for Claude
+    taxonomy_hint = ""
+    if taxonomy and taxonomy.get("categories"):
+        cat_list = []
+        for cat in taxonomy["categories"]:
+            subs = [s["name"] for s in cat.get("subcategories", [])]
+            if subs:
+                cat_list.append(f'{cat["id"]} ({cat["name"]}) → subcategories: {", ".join(subs)}')
+            else:
+                cat_list.append(f'{cat["id"]} ({cat["name"]})')
+        taxonomy_hint = f"\n\nThe operator uses these categories:\n" + "\n".join(cat_list) + "\nAssign content_type using the category IDs above."
+
     content.append({
         "type": "text",
         "text": f"""Caption: "{caption}"
-Niche: {niche or "general"}
+Niche: {niche or "general"}{taxonomy_hint}
 
 Analyse this video content and respond ONLY with valid JSON:
 {{
@@ -232,8 +244,9 @@ def analyse_video(req: AnalyseVideoRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 class ScanDriveRequest(BaseModel):
-    client_id: str  # clientId field in Firestore (e.g. "ilai")
+    client_id: str
     google_access_token: Optional[str] = None
+    taxonomy: Optional[dict] = None  # custom category structure from operator
 
 @app.post("/scan-drive")
 def scan_drive(req: ScanDriveRequest):
@@ -298,7 +311,7 @@ def scan_drive(req: ScanDriveRequest):
             try:
                 frames = extract_frames(video_url, num_frames=4, extra_headers=download_headers)
                 if frames:
-                    analysis = analyse_video_with_claude(frames, clip.get("caption", ""), niche)
+                    analysis = analyse_video_with_claude(frames, clip.get("caption", ""), niche, req.taxonomy)
                     firestore_patch(f"clips/{clip_id}", {
                         "aiContentType": analysis.get("content_type", "unknown"),
                         "aiHasFace": str(analysis.get("has_face", False)),
