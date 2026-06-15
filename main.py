@@ -266,6 +266,7 @@ def scan_drive(req: ScanDriveRequest):
 
         analysed = []
         errors = []
+        skipped = []
 
         for item in clips_data:
             doc = item.get("document")
@@ -286,7 +287,7 @@ def scan_drive(req: ScanDriveRequest):
                 video_url = f"https://www.googleapis.com/drive/v3/files/{drive_file_id}?alt=media"
 
             if not video_url:
-                errors.append({"clip_id": clip_id, "error": "No video URL"})
+                skipped.append({"clip_id": clip_id, "reason": "No video URL", "has_token": bool(req.google_access_token), "drive_file_id": drive_file_id})
                 continue
 
             # Build headers for download (Drive API needs auth)
@@ -313,7 +314,15 @@ def scan_drive(req: ScanDriveRequest):
             except Exception as e:
                 errors.append({"clip_id": clip_id, "error": str(e)})
 
-        return {"success": True, "analysed": len(analysed), "errors": len(errors), "results": analysed}
+        return {
+            "success": True,
+            "analysed": len(analysed),
+            "errors": len(errors),
+            "skipped": len(skipped),
+            "skip_reasons": skipped[:5],  # first 5 for debugging
+            "has_token": bool(req.google_access_token),
+            "results": analysed
+        }
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
