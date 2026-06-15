@@ -248,20 +248,16 @@ def scan_drive(req: ScanDriveRequest):
         niche = client.get("niche", "")
 
         # Get unanalysed clips for this client
+        # We filter only by clientId, then skip already-analysed ones in Python
+        # (Firestore can't query for "field does not exist")
         url = f"https://firestore.googleapis.com/v1/projects/{FIREBASE_PROJECT_ID}/databases/(default)/documents:runQuery"
         body = {
             "structuredQuery": {
                 "from": [{"collectionId": "clips"}],
                 "where": {
-                    "compositeFilter": {
-                        "op": "AND",
-                        "filters": [
-                            {"fieldFilter": {"field": {"fieldPath": "clientId"}, "op": "EQUAL", "value": {"stringValue": req.client_id}}},
-                            {"fieldFilter": {"field": {"fieldPath": "aiAnalysedAt"}, "op": "EQUAL", "value": {"nullValue": None}}}
-                        ]
-                    }
+                    "fieldFilter": {"field": {"fieldPath": "clientId"}, "op": "EQUAL", "value": {"stringValue": req.client_id}}
                 },
-                "limit": 20
+                "limit": 50
             }
         }
         r = requests.post(url, json=body)
@@ -275,6 +271,9 @@ def scan_drive(req: ScanDriveRequest):
             if not doc:
                 continue
             clip = parse_fs_doc(doc)
+            # Skip clips already analysed
+            if clip.get("aiAnalysedAt"):
+                continue
             clip_id = doc["name"].split("/")[-1]
             video_url = clip.get("driveUrl") or clip.get("bunnyUrl") or clip.get("downloadUrl")
 
