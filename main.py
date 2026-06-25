@@ -248,6 +248,8 @@ class ScanDriveRequest(BaseModel):
     google_access_token: Optional[str] = None
     taxonomy: Optional[dict] = None  # custom category structure from operator
     protected_folders: Optional[list[str]] = None  # folder paths to skip (frozen/additive)
+    folder_filter: Optional[str] = None  # if set, only scan clips in this folder (+ subfolders)
+    batch_size: Optional[int] = 50  # how many clips to analyse this call
 
 
 def _is_protected(path: str, protected: list[str]) -> bool:
@@ -270,9 +272,8 @@ def scan_drive(req: ScanDriveRequest):
         client = parse_fs_doc(doc)
         niche = client.get("niche", "")
 
-        # Get unanalysed clips for this client
-        # We filter only by clientId, then skip already-analysed ones in Python
-        # (Firestore can't query for "field does not exist")
+        # Fetch a wide candidate set for this client, then filter in Python
+        # (Firestore can't query "field does not exist" or string prefixes).
         url = f"https://firestore.googleapis.com/v1/projects/{FIREBASE_PROJECT_ID}/databases/(default)/documents:runQuery"
         body = {
             "structuredQuery": {
@@ -280,7 +281,7 @@ def scan_drive(req: ScanDriveRequest):
                 "where": {
                     "fieldFilter": {"field": {"fieldPath": "clientId"}, "op": "EQUAL", "value": {"stringValue": req.client_id}}
                 },
-                "limit": 50
+                "limit": 1000
             }
         }
         r = requests.post(url, json=body)
@@ -289,18 +290,24 @@ def scan_drive(req: ScanDriveRequest):
         analysed = []
         errors = []
         skipped = []
+        batch_size = req.batch_size or 50
 
         for item in clips_data:
+            if len(analysed) >= batch_size:
+                break  # stop once we've analysed a full batch
             doc = item.get("document")
             if not doc:
                 continue
             clip = parse_fs_doc(doc)
+            path = clip.get("path", "")
             # Skip clips already analysed
             if clip.get("aiAnalysedAt"):
                 continue
-            # Skip clips in protected (frozen/additive) folders — agent won't move them,
-            # so analysing them is wasted cost.
-            if req.protected_folders and _is_protected(clip.get("path", ""), req.protected_folders):
+            # Skip clips in protected (frozen/additive) folders — agent won't move them.
+            if req.protected_folders and _is_protected(path, req.protected_folders):
+                continue
+            # If a folder filter is set, only scan clips in that folder (or its subfolders)
+            if req.folder_filter and not (path == req.folder_filter or path.startswith(req.folder_filter + "/")):
                 continue
             clip_id = doc["name"].split("/")[-1]
 
