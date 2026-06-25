@@ -247,6 +247,15 @@ class ScanDriveRequest(BaseModel):
     client_id: str
     google_access_token: Optional[str] = None
     taxonomy: Optional[dict] = None  # custom category structure from operator
+    protected_folders: Optional[list[str]] = None  # folder paths to skip (frozen/additive)
+
+
+def _is_protected(path: str, protected: list[str]) -> bool:
+    """A clip is protected if its folder path is, or is inside, a protected folder."""
+    for folder in protected:
+        if path == folder or path.startswith(folder + "/"):
+            return True
+    return False
 
 @app.post("/scan-drive")
 def scan_drive(req: ScanDriveRequest):
@@ -288,6 +297,10 @@ def scan_drive(req: ScanDriveRequest):
             clip = parse_fs_doc(doc)
             # Skip clips already analysed
             if clip.get("aiAnalysedAt"):
+                continue
+            # Skip clips in protected (frozen/additive) folders — agent won't move them,
+            # so analysing them is wasted cost.
+            if req.protected_folders and _is_protected(clip.get("path", ""), req.protected_folders):
                 continue
             clip_id = doc["name"].split("/")[-1]
 
