@@ -6,7 +6,7 @@ import subprocess
 import tempfile
 import requests
 import anthropic
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional
@@ -259,104 +259,89 @@ def _is_protected(path: str, protected: list[str]) -> bool:
             return True
     return False
 
-@app.post("/scan-drive")
-def scan_drive(req: ScanDriveRequest):
-    """Scan a client's Firestore clips and analyse any untagged ones."""
-    try:
-        # Get client info
-        result = firestore_query("users", "clientId", req.client_id)
-        doc = next((r.get("document") for r in result if r.get("document")), None)
+def _select_scan_candidates(req: ScanDriveRequest):
+    """Return (niche, [clip dicts to scan]) honoring protection + folder filter + batch size."""
+    result = firestore_query("users", "clientId", req.client_id)
+    doc = next((r.get("document") for r in result if r.get("document")), None)
+    if not doc:
+        raise HTTPException(status_code=404, detail="Client not found")
+    niche = parse_fs_doc(doc).get("niche", "")
+
+    url = f"https://firestore.googleapis.com/v1/projects/{FIREBASE_PROJECT_ID}/databases/(default)/documents:runQuery"
+    body = {
+        "structuredQuery": {
+            "from": [{"collectionId": "clips"}],
+            "where": {
+                "fieldFilter": {"field": {"fieldPath": "clientId"}, "op": "EQUAL", "value": {"stringValue": req.client_id}}
+            },
+            "limit": 1000,
+        }
+    }
+    clips_data = requests.post(url, json=body).json()
+    batch_size = req.batch_size or 50
+
+    candidates = []
+    for item in clips_data:
+        if len(candidates) >= batch_size:
+            break
+        doc = item.get("document")
         if not doc:
-            raise HTTPException(status_code=404, detail="Client not found")
+            continue
+        clip = parse_fs_doc(doc)
+        path = clip.get("path", "")
+        if clip.get("aiAnalysedAt"):
+            continue
+        if req.protected_folders and _is_protected(path, req.protected_folders):
+            continue
+        if req.folder_filter and not (path == req.folder_filter or path.startswith(req.folder_filter + "/")):
+            continue
+        clip["_id"] = doc["name"].split("/")[-1]
+        candidates.append(clip)
+    return niche, candidates
 
-        client = parse_fs_doc(doc)
-        niche = client.get("niche", "")
 
-        # Fetch a wide candidate set for this client, then filter in Python
-        # (Firestore can't query "field does not exist" or string prefixes).
-        url = f"https://firestore.googleapis.com/v1/projects/{FIREBASE_PROJECT_ID}/databases/(default)/documents:runQuery"
-        body = {
-            "structuredQuery": {
-                "from": [{"collectionId": "clips"}],
-                "where": {
-                    "fieldFilter": {"field": {"fieldPath": "clientId"}, "op": "EQUAL", "value": {"stringValue": req.client_id}}
-                },
-                "limit": 1000
-            }
-        }
-        r = requests.post(url, json=body)
-        clips_data = r.json()
+def _run_scan(req: ScanDriveRequest, niche: str, candidates: list):
+    """Analyse the selected clips and write results to Firestore. Runs in background."""
+    for clip in candidates:
+        clip_id = clip["_id"]
+        video_url = clip.get("bunnyUrl") or clip.get("driveUrl") or clip.get("downloadUrl")
+        drive_file_id = clip.get("driveFileId")
+        if not video_url and drive_file_id and req.google_access_token:
+            video_url = f"https://www.googleapis.com/drive/v3/files/{drive_file_id}?alt=media"
+        if not video_url:
+            continue
+        download_headers = {}
+        if "googleapis.com" in video_url and req.google_access_token:
+            download_headers["Authorization"] = f"Bearer {req.google_access_token}"
+        try:
+            frames = extract_frames(video_url, num_frames=4, extra_headers=download_headers)
+            if frames:
+                analysis = analyse_video_with_claude(frames, clip.get("caption", ""), niche, req.taxonomy)
+                firestore_patch(f"clips/{clip_id}", {
+                    "aiContentType": analysis.get("content_type", "unknown"),
+                    "aiHasFace": str(analysis.get("has_face", False)),
+                    "aiIsTalking": str(analysis.get("is_talking_to_camera", False)),
+                    "aiEnergyLevel": analysis.get("energy_level", "medium"),
+                    "aiHookQuality": str(analysis.get("hook_quality", 5)),
+                    "aiTopic": analysis.get("topic", ""),
+                    "aiUsabilityScore": str(analysis.get("usability_score", 5)),
+                    "aiNotes": analysis.get("notes", ""),
+                    "aiAnalysedAt": datetime.utcnow().isoformat(),
+                })
+        except Exception as e:
+            print(f"Scan error on {clip_id}: {e}")
 
-        analysed = []
-        errors = []
-        skipped = []
-        batch_size = req.batch_size or 50
 
-        for item in clips_data:
-            if len(analysed) >= batch_size:
-                break  # stop once we've analysed a full batch
-            doc = item.get("document")
-            if not doc:
-                continue
-            clip = parse_fs_doc(doc)
-            path = clip.get("path", "")
-            # Skip clips already analysed
-            if clip.get("aiAnalysedAt"):
-                continue
-            # Skip clips in protected (frozen/additive) folders — agent won't move them.
-            if req.protected_folders and _is_protected(path, req.protected_folders):
-                continue
-            # If a folder filter is set, only scan clips in that folder (or its subfolders)
-            if req.folder_filter and not (path == req.folder_filter or path.startswith(req.folder_filter + "/")):
-                continue
-            clip_id = doc["name"].split("/")[-1]
-
-            # Build video URL — prefer Bunny CDN (no auth needed), fall back to Drive API
-            video_url = clip.get("bunnyUrl") or clip.get("driveUrl") or clip.get("downloadUrl")
-            drive_file_id = clip.get("driveFileId")
-
-            # If no direct URL but we have a Drive file ID + token, use Drive API
-            if not video_url and drive_file_id and req.google_access_token:
-                video_url = f"https://www.googleapis.com/drive/v3/files/{drive_file_id}?alt=media"
-
-            if not video_url:
-                skipped.append({"clip_id": clip_id, "reason": "No video URL", "has_token": bool(req.google_access_token), "drive_file_id": drive_file_id})
-                continue
-
-            # Build headers for download (Drive API needs auth)
-            download_headers = {}
-            if "googleapis.com" in video_url and req.google_access_token:
-                download_headers["Authorization"] = f"Bearer {req.google_access_token}"
-
-            try:
-                frames = extract_frames(video_url, num_frames=4, extra_headers=download_headers)
-                if frames:
-                    analysis = analyse_video_with_claude(frames, clip.get("caption", ""), niche, req.taxonomy)
-                    firestore_patch(f"clips/{clip_id}", {
-                        "aiContentType": analysis.get("content_type", "unknown"),
-                        "aiHasFace": str(analysis.get("has_face", False)),
-                        "aiIsTalking": str(analysis.get("is_talking_to_camera", False)),
-                        "aiEnergyLevel": analysis.get("energy_level", "medium"),
-                        "aiHookQuality": str(analysis.get("hook_quality", 5)),
-                        "aiTopic": analysis.get("topic", ""),
-                        "aiUsabilityScore": str(analysis.get("usability_score", 5)),
-                        "aiNotes": analysis.get("notes", ""),
-                        "aiAnalysedAt": datetime.utcnow().isoformat(),
-                    })
-                    analysed.append({"clip_id": clip_id, "analysis": analysis})
-            except Exception as e:
-                errors.append({"clip_id": clip_id, "error": str(e)})
-
-        return {
-            "success": True,
-            "analysed": len(analysed),
-            "errors": len(errors),
-            "skipped": len(skipped),
-            "skip_reasons": skipped[:5],  # first 5 for debugging
-            "has_token": bool(req.google_access_token),
-            "results": analysed
-        }
-
+@app.post("/scan-drive")
+def scan_drive(req: ScanDriveRequest, background_tasks: BackgroundTasks):
+    """Kick off a background scan and return immediately with how many will be scanned.
+    The frontend polls Firestore to watch tags appear."""
+    try:
+        niche, candidates = _select_scan_candidates(req)
+        background_tasks.add_task(_run_scan, req, niche, candidates)
+        return {"success": True, "started": True, "to_scan": len(candidates), "has_token": bool(req.google_access_token)}
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
