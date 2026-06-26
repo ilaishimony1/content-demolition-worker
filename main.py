@@ -176,7 +176,7 @@ Niche: {niche or "general"}{taxonomy_hint}
 Analyse this video content and respond ONLY with valid JSON:
 {{
   "content_type": "talking_reel|action_reel|broll|carousel|transformation|tutorial|vlog",
-  "tags": ["ALL applicable labels — both the FORMAT and every ACTIVITY/SUBJECT visible. A man talking to camera while cycling = [\\"vlog\\", \\"cycling\\", \\"outdoor\\"]. Include sports/activities (running, cycling, swimming, climbing, motorbike, gym), settings, and format. Lowercase, single words where possible."],
+  "tags": ["Give 6-12 SPECIFIC tags so someone can sort this clip WITHOUT watching it. Cover every dimension you can see: ACTIVITY/SPORT (running, cycling, swimming, climbing, motorbike, gym, weightlifting, flips, hiking, surfing), PLACE/SETTING (ocean, beach, mountains, gym, kitchen, street, forest, pool, desert), OBJECTS (bike, barbell, food, coffee, car, dog, drone), PEOPLE (friends, family, girlfriend, group, solo), VIBE/THEME (travel, adventure, food, party, nature, sunset, training), and FORMAT (vlog, talking-head, broll, action). Be concrete and specific — prefer 'ocean kayaking' over just 'outdoor'. Lowercase. Example for a clip of him doing flips off a boat into the sea with friends: [\\"flips\\", \\"jumping\\", \\"ocean\\", \\"boat\\", \\"friends\\", \\"swimming\\", \\"summer\\", \\"vlog\\", \\"adventure\\"]."],
   "has_face": true/false,
   "is_talking_to_camera": true/false,
   "energy_level": "low|medium|high|explosive",
