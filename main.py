@@ -51,6 +51,8 @@ def firestore_patch(path: str, fields: dict):
             fs_fields[k] = {"booleanValue": v}
         elif isinstance(v, int) or isinstance(v, float):
             fs_fields[k] = {"doubleValue": float(v)}
+        elif isinstance(v, list):
+            fs_fields[k] = {"arrayValue": {"values": [{"stringValue": str(item)} for item in v]}}
         elif isinstance(v, dict):
             fs_fields[k] = {"mapValue": {"fields": {kk: {"stringValue": str(vv)} for kk, vv in v.items()}}}
         else:
@@ -174,6 +176,7 @@ Niche: {niche or "general"}{taxonomy_hint}
 Analyse this video content and respond ONLY with valid JSON:
 {{
   "content_type": "talking_reel|action_reel|broll|carousel|transformation|tutorial|vlog",
+  "tags": ["ALL applicable labels — both the FORMAT and every ACTIVITY/SUBJECT visible. A man talking to camera while cycling = [\\"vlog\\", \\"cycling\\", \\"outdoor\\"]. Include sports/activities (running, cycling, swimming, climbing, motorbike, gym), settings, and format. Lowercase, single words where possible."],
   "has_face": true/false,
   "is_talking_to_camera": true/false,
   "energy_level": "low|medium|high|explosive",
@@ -317,7 +320,7 @@ def _run_scan(req: ScanDriveRequest, niche: str, candidates: list):
             frames = extract_frames(video_url, num_frames=4, extra_headers=download_headers)
             if frames:
                 analysis = analyse_video_with_claude(frames, clip.get("caption", ""), niche, req.taxonomy)
-                firestore_patch(f"clips/{clip_id}", {
+                fields = {
                     "aiContentType": analysis.get("content_type", "unknown"),
                     "aiHasFace": str(analysis.get("has_face", False)),
                     "aiIsTalking": str(analysis.get("is_talking_to_camera", False)),
@@ -327,7 +330,11 @@ def _run_scan(req: ScanDriveRequest, niche: str, candidates: list):
                     "aiUsabilityScore": str(analysis.get("usability_score", 5)),
                     "aiNotes": analysis.get("notes", ""),
                     "aiAnalysedAt": datetime.utcnow().isoformat(),
-                })
+                }
+                tags = analysis.get("tags")
+                if isinstance(tags, list):
+                    fields["aiTags"] = [str(t).lower().strip() for t in tags if t]
+                firestore_patch(f"clips/{clip_id}", fields)
         except Exception as e:
             print(f"Scan error on {clip_id}: {e}")
 
