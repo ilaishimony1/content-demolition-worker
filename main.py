@@ -132,23 +132,40 @@ def extract_frames(video_url: str, num_frames: int = 4, extra_headers: dict = {}
         except:
             pass
 
-        # Extract frames: hook (0.5s), early (2s), mid, near-end
+        # ── 2a: fast seek-based extraction (input seek) — works for most files ──
         timestamps = [0.5, min(2.0, duration * 0.1), duration * 0.5, duration * 0.85]
-
         last_ffmpeg_err = ""
         for i, ts in enumerate(timestamps[:num_frames]):
             frame_path = os.path.join(tmp, f"frame_{i}.jpg")
             proc = subprocess.run([
                 "ffmpeg", "-ss", str(ts), "-i", video_path,
                 "-vframes", "1", "-q:v", "3", "-vf", "scale=720:-1",
-                frame_path, "-y"
+                "-an", frame_path, "-y"
             ], capture_output=True, text=True)
             if proc.returncode != 0:
                 last_ffmpeg_err = (proc.stderr or "")[-150:]
-
             if os.path.exists(frame_path):
                 with open(frame_path, "rb") as f:
                     frames.append(base64.b64encode(f.read()).decode())
+
+        # ── 2b: robust fallback — single sequential decode pass. Handles iPhone
+        # Dolby Vision / HEVC HDR clips that the fast seek method can't grab. ──
+        if not frames:
+            interval = max(0.5, duration / (num_frames + 1))
+            out_pattern = os.path.join(tmp, "seq_%02d.jpg")
+            proc = subprocess.run([
+                "ffmpeg", "-i", video_path,
+                "-vf", f"fps=1/{interval:.3f},scale=720:-1",
+                "-frames:v", str(num_frames), "-q:v", "3", "-an",
+                out_pattern, "-y"
+            ], capture_output=True, text=True)
+            if proc.returncode != 0:
+                last_ffmpeg_err = (proc.stderr or "")[-150:]
+            for i in range(1, num_frames + 1):
+                fp = os.path.join(tmp, f"seq_{i:02d}.jpg")
+                if os.path.exists(fp):
+                    with open(fp, "rb") as f:
+                        frames.append(base64.b64encode(f.read()).decode())
 
         if not frames:
             raise RuntimeError(f"FFMPEG_FAILED no frames: {last_ffmpeg_err or 'unknown'}")
