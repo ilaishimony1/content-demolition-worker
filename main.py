@@ -94,7 +94,7 @@ def parse_fs_doc(doc: dict) -> dict:
 
 # ─── Video analysis with Claude Vision ───────────────────────────────────────
 
-def extract_frames(video_url: str, num_frames: int = 4, extra_headers: dict = {}) -> list[str]:
+def extract_frames(video_url: str, num_frames: int = 3, extra_headers: dict = {}) -> list[str]:
     """Download video and extract frames as base64 images using FFmpeg."""
     frames = []
     with tempfile.TemporaryDirectory() as tmp:
@@ -139,7 +139,7 @@ def extract_frames(video_url: str, num_frames: int = 4, extra_headers: dict = {}
             frame_path = os.path.join(tmp, f"frame_{i}.jpg")
             proc = subprocess.run([
                 "ffmpeg", "-ss", str(ts), "-i", video_path,
-                "-vframes", "1", "-q:v", "3", "-vf", "scale=720:-1",
+                "-vframes", "1", "-q:v", "3", "-vf", "scale=512:-1",
                 "-an", frame_path, "-y"
             ], capture_output=True, text=True)
             if proc.returncode != 0:
@@ -155,7 +155,7 @@ def extract_frames(video_url: str, num_frames: int = 4, extra_headers: dict = {}
             out_pattern = os.path.join(tmp, "seq_%02d.jpg")
             proc = subprocess.run([
                 "ffmpeg", "-i", video_path,
-                "-vf", f"fps=1/{interval:.3f},scale=720:-1",
+                "-vf", f"fps=1/{interval:.3f},scale=512:-1",
                 "-frames:v", str(num_frames), "-q:v", "3", "-an",
                 out_pattern, "-y"
             ], capture_output=True, text=True)
@@ -207,20 +207,12 @@ def analyse_video_with_claude(frames: list[str], caption: str = "", niche: str =
         "text": f"""Caption: "{caption}"
 Niche: {niche or "general"}{taxonomy_hint}
 
-Analyse this video content and respond ONLY with valid JSON:
+Tag this video for a B-roll library. Respond ONLY with valid JSON:
 {{
   "content_type": "talking_reel|action_reel|broll|carousel|transformation|tutorial|vlog",
   "tags": ["Give 6-12 SPECIFIC tags so someone can sort this clip WITHOUT watching it. Cover every dimension you can see: ACTIVITY/SPORT (running, cycling, swimming, climbing, motorbike, gym, weightlifting, flips, hiking, surfing), PLACE/SETTING (ocean, beach, mountains, gym, kitchen, street, forest, pool, desert), OBJECTS (bike, barbell, food, coffee, car, dog, drone), PEOPLE (friends, family, girlfriend, group, solo), VIBE/THEME (travel, adventure, food, party, nature, sunset, training), and FORMAT (vlog, talking-head, broll, action). Be concrete and specific — prefer 'ocean kayaking' over just 'outdoor'. Lowercase. Example for a clip of him doing flips off a boat into the sea with friends: [\\"flips\\", \\"jumping\\", \\"ocean\\", \\"boat\\", \\"friends\\", \\"swimming\\", \\"summer\\", \\"vlog\\", \\"adventure\\"]."],
   "has_face": true/false,
-  "is_talking_to_camera": true/false,
-  "energy_level": "low|medium|high|explosive",
-  "hook_type": "question|statement|action|curiosity|transformation|story",
-  "hook_quality": 1-10,
-  "topic": "brief topic description",
-  "setting": "gym|outdoor|home|studio|street|other",
-  "has_text_overlay": true/false,
-  "usability_score": 1-10,
-  "notes": "1 sentence about what makes this content work or not"
+  "topic": "brief topic description (3-6 words)"
 }}"""
     })
 
@@ -391,18 +383,13 @@ def _run_scan(req: ScanDriveRequest, niche: str, candidates: list):
         if "googleapis.com" in video_url and req.google_access_token:
             download_headers["Authorization"] = f"Bearer {req.google_access_token}"
         try:
-            frames = extract_frames(video_url, num_frames=4, extra_headers=download_headers)
+            frames = extract_frames(video_url, num_frames=3, extra_headers=download_headers)
             if frames:
                 analysis = analyse_video_with_claude(frames, clip.get("caption", ""), niche, req.taxonomy)
                 fields = {
                     "aiContentType": analysis.get("content_type", "unknown"),
                     "aiHasFace": str(analysis.get("has_face", False)),
-                    "aiIsTalking": str(analysis.get("is_talking_to_camera", False)),
-                    "aiEnergyLevel": analysis.get("energy_level", "medium"),
-                    "aiHookQuality": str(analysis.get("hook_quality", 5)),
                     "aiTopic": analysis.get("topic", ""),
-                    "aiUsabilityScore": str(analysis.get("usability_score", 5)),
-                    "aiNotes": analysis.get("notes", ""),
                     "aiAnalysedAt": datetime.utcnow().isoformat(),
                 }
                 tags = analysis.get("tags")
@@ -460,7 +447,7 @@ class AnalyseIGPostRequest(BaseModel):
 def analyse_ig_post(req: AnalyseIGPostRequest):
     """Analyse an Instagram post video with Claude Vision."""
     try:
-        frames = extract_frames(req.video_url, num_frames=4)
+        frames = extract_frames(req.video_url, num_frames=3)
         if not frames:
             return {"success": False, "error": "Could not extract frames", "post_id": req.post_id}
 
