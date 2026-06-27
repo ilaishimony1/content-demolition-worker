@@ -339,7 +339,11 @@ def _select_scan_candidates(req: ScanDriveRequest):
                 continue  # scanner is video-only — skip photos
             if req.protected_folders and _is_protected(path, req.protected_folders):
                 continue
-            if req.folder_filter and not (path == req.folder_filter or path.startswith(req.folder_filter + "/")):
+            # Match folder by EFFECTIVE path (where the operator filed it in-app),
+            # falling back to real Drive path — so "scan ספורט" catches clips moved
+            # into ספורט even if their real Drive folder is still elsewhere.
+            eff_path = clip.get("organizedPath") or path
+            if req.folder_filter and not (eff_path == req.folder_filter or eff_path.startswith(req.folder_filter + "/")):
                 continue
             clip["_id"] = doc["name"].split("/")[-1]
             candidates.append(clip)
