@@ -100,14 +100,24 @@ def extract_frames(video_url: str, num_frames: int = 4, extra_headers: dict = {}
     with tempfile.TemporaryDirectory() as tmp:
         video_path = os.path.join(tmp, "video.mp4")
 
-        # Download video (with optional auth headers for Google Drive).
-        # Long timeout — Tom's sport clips can be 50-100MB.
-        r = requests.get(video_url, stream=True, timeout=180, headers=extra_headers)
-        with open(video_path, "wb") as f:
-            for chunk in r.iter_content(chunk_size=1 << 16):
-                f.write(chunk)
+        # ── Stage 1: download (with optional auth headers for Google Drive) ──
+        try:
+            r = requests.get(video_url, stream=True, timeout=180, headers=extra_headers)
+            if r.status_code != 200:
+                raise RuntimeError(f"DOWNLOAD_FAILED http {r.status_code}: {r.text[:150]}")
+            total = 0
+            with open(video_path, "wb") as f:
+                for chunk in r.iter_content(chunk_size=1 << 16):
+                    f.write(chunk)
+                    total += len(chunk)
+            if total == 0:
+                raise RuntimeError("DOWNLOAD_FAILED empty file")
+        except RuntimeError:
+            raise
+        except Exception as e:
+            raise RuntimeError(f"DOWNLOAD_FAILED {type(e).__name__}: {str(e)[:150]}")
 
-        # Get video duration
+        # ── Stage 2: probe + frame extraction ──
         probe = subprocess.run(
             ["ffprobe", "-v", "quiet", "-print_format", "json", "-show_streams", video_path],
             capture_output=True, text=True
@@ -125,17 +135,23 @@ def extract_frames(video_url: str, num_frames: int = 4, extra_headers: dict = {}
         # Extract frames: hook (0.5s), early (2s), mid, near-end
         timestamps = [0.5, min(2.0, duration * 0.1), duration * 0.5, duration * 0.85]
 
+        last_ffmpeg_err = ""
         for i, ts in enumerate(timestamps[:num_frames]):
             frame_path = os.path.join(tmp, f"frame_{i}.jpg")
-            subprocess.run([
+            proc = subprocess.run([
                 "ffmpeg", "-ss", str(ts), "-i", video_path,
                 "-vframes", "1", "-q:v", "3", "-vf", "scale=720:-1",
                 frame_path, "-y"
-            ], capture_output=True)
+            ], capture_output=True, text=True)
+            if proc.returncode != 0:
+                last_ffmpeg_err = (proc.stderr or "")[-150:]
 
             if os.path.exists(frame_path):
                 with open(frame_path, "rb") as f:
                     frames.append(base64.b64encode(f.read()).decode())
+
+        if not frames:
+            raise RuntimeError(f"FFMPEG_FAILED no frames: {last_ffmpeg_err or 'unknown'}")
 
     return frames
 
