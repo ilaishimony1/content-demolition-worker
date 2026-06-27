@@ -325,7 +325,22 @@ def _select_scan_candidates(req: ScanDriveRequest):
 
 
 def _run_scan(req: ScanDriveRequest, niche: str, candidates: list):
-    """Analyse the selected clips and write results to Firestore. Runs in background."""
+    """Analyse the selected clips and write results to Firestore. Runs in background.
+    Writes live progress + errors to scanStatus/{client_id} so the app can show them."""
+    total = len(candidates)
+    done = 0
+    errors = 0
+    last_error = ""
+
+    def status():
+        firestore_patch(f"scanStatus/{req.client_id}", {
+            "running": (done + errors) < total,
+            "total": total, "done": done, "errors": errors,
+            "lastError": last_error[:300],
+            "updatedAt": datetime.utcnow().isoformat(),
+        })
+
+    status()
     for clip in candidates:
         clip_id = clip["_id"]
         video_url = clip.get("bunnyUrl") or clip.get("driveUrl") or clip.get("downloadUrl")
@@ -333,6 +348,9 @@ def _run_scan(req: ScanDriveRequest, niche: str, candidates: list):
         if not video_url and drive_file_id and req.google_access_token:
             video_url = f"https://www.googleapis.com/drive/v3/files/{drive_file_id}?alt=media"
         if not video_url:
+            errors += 1
+            last_error = f"{clip.get('name','?')}: no video URL"
+            status()
             continue
         download_headers = {}
         if "googleapis.com" in video_url and req.google_access_token:
@@ -356,8 +374,15 @@ def _run_scan(req: ScanDriveRequest, niche: str, candidates: list):
                 if isinstance(tags, list):
                     fields["aiTags"] = [str(t).lower().strip() for t in tags if t]
                 firestore_patch(f"clips/{clip_id}", fields)
+                done += 1
+            else:
+                errors += 1
+                last_error = f"{clip.get('name','?')}: no frames extracted"
         except Exception as e:
+            errors += 1
+            last_error = f"{clip.get('name','?')}: {e}"
             print(f"Scan error on {clip_id}: {e}")
+        status()
 
 
 @app.post("/scan-drive")
