@@ -225,7 +225,9 @@ Analyse this video content and respond ONLY with valid JSON:
     })
 
     message = claude.messages.create(
-        model="claude-opus-4-5",
+        # Sonnet — ~10x cheaper than Opus, excellent for vision tagging.
+        # Override per-deploy with SCAN_MODEL env var if you ever want Opus/Haiku.
+        model=os.environ.get("SCAN_MODEL", "claude-sonnet-4-6"),
         max_tokens=500,
         messages=[{"role": "user", "content": content}]
     )
