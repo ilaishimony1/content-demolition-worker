@@ -208,7 +208,12 @@ Analyse this video content and respond ONLY with valid JSON:
 
 @app.get("/")
 def health():
-    return {"status": "running", "service": "Content Demolition Worker", "agents": ["video-analyser", "drive-scanner", "reel-builder", "auto-poster"]}
+    return {
+        "status": "running",
+        "service": "Content Demolition Worker",
+        "version": os.environ.get("RAILWAY_GIT_COMMIT_SHA", "unknown")[:7],
+        "agents": ["video-analyser", "drive-scanner", "reel-builder", "auto-poster"],
+    }
 
 class AnalyseVideoRequest(BaseModel):
     video_url: str
