@@ -272,37 +272,50 @@ def _select_scan_candidates(req: ScanDriveRequest):
     niche = parse_fs_doc(doc).get("niche", "")
 
     url = f"https://firestore.googleapis.com/v1/projects/{FIREBASE_PROJECT_ID}/databases/(default)/documents:runQuery"
-    body = {
-        "structuredQuery": {
-            "from": [{"collectionId": "clips"}],
-            "where": {
-                "fieldFilter": {"field": {"fieldPath": "clientId"}, "op": "EQUAL", "value": {"stringValue": req.client_id}}
-            },
-            "limit": 1000,
-        }
-    }
-    clips_data = requests.post(url, json=body).json()
     batch_size = req.batch_size or 50
+    PAGE = 1000
 
+    # Page through ALL of the client's clips (a client can have 2000+), so we don't
+    # miss unscanned clips sitting beyond the first page.
     candidates = []
-    for item in clips_data:
-        if len(candidates) >= batch_size:
-            break
-        doc = item.get("document")
-        if not doc:
-            continue
-        clip = parse_fs_doc(doc)
-        path = clip.get("path", "")
-        if clip.get("aiAnalysedAt"):
-            continue
-        if clip.get("mediaType") == "image":
-            continue  # scanner is video-only — skip photos
-        if req.protected_folders and _is_protected(path, req.protected_folders):
-            continue
-        if req.folder_filter and not (path == req.folder_filter or path.startswith(req.folder_filter + "/")):
-            continue
-        clip["_id"] = doc["name"].split("/")[-1]
-        candidates.append(clip)
+    offset = 0
+    while len(candidates) < batch_size:
+        body = {
+            "structuredQuery": {
+                "from": [{"collectionId": "clips"}],
+                "where": {
+                    "fieldFilter": {"field": {"fieldPath": "clientId"}, "op": "EQUAL", "value": {"stringValue": req.client_id}}
+                },
+                "offset": offset,
+                "limit": PAGE,
+            }
+        }
+        page = requests.post(url, json=body).json()
+        rows = [it for it in page if it.get("document")]
+        if not rows:
+            break  # no more clips
+
+        for item in rows:
+            if len(candidates) >= batch_size:
+                break
+            doc = item["document"]
+            clip = parse_fs_doc(doc)
+            path = clip.get("path", "")
+            if clip.get("aiAnalysedAt"):
+                continue
+            if clip.get("mediaType") == "image":
+                continue  # scanner is video-only — skip photos
+            if req.protected_folders and _is_protected(path, req.protected_folders):
+                continue
+            if req.folder_filter and not (path == req.folder_filter or path.startswith(req.folder_filter + "/")):
+                continue
+            clip["_id"] = doc["name"].split("/")[-1]
+            candidates.append(clip)
+
+        if len(rows) < PAGE:
+            break  # reached the last page
+        offset += PAGE
+
     return niche, candidates
 
 
