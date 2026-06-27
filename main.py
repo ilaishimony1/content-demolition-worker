@@ -100,10 +100,11 @@ def extract_frames(video_url: str, num_frames: int = 4, extra_headers: dict = {}
     with tempfile.TemporaryDirectory() as tmp:
         video_path = os.path.join(tmp, "video.mp4")
 
-        # Download video (with optional auth headers for Google Drive)
-        r = requests.get(video_url, stream=True, timeout=60, headers=extra_headers)
+        # Download video (with optional auth headers for Google Drive).
+        # Long timeout — Tom's sport clips can be 50-100MB.
+        r = requests.get(video_url, stream=True, timeout=180, headers=extra_headers)
         with open(video_path, "wb") as f:
-            for chunk in r.iter_content(chunk_size=8192):
+            for chunk in r.iter_content(chunk_size=1 << 16):
                 f.write(chunk)
 
         # Get video duration
@@ -294,6 +295,8 @@ def _select_scan_candidates(req: ScanDriveRequest):
         path = clip.get("path", "")
         if clip.get("aiAnalysedAt"):
             continue
+        if clip.get("mediaType") == "image":
+            continue  # scanner is video-only — skip photos
         if req.protected_folders and _is_protected(path, req.protected_folders):
             continue
         if req.folder_filter and not (path == req.folder_filter or path.startswith(req.folder_filter + "/")):
