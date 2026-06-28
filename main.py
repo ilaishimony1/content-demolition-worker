@@ -424,6 +424,98 @@ def scan_drive(req: ScanDriveRequest, background_tasks: BackgroundTasks):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+# ─── Push to Drive: mirror the in-app structure into real Google Drive ────────
+
+def _drive_headers(token: str) -> dict:
+    return {"Authorization": f"Bearer {token}"}
+
+def _drive_find_folder(name: str, parent_id: str, token: str) -> Optional[str]:
+    safe = name.replace("\\", "\\\\").replace("'", "\\'")
+    q = (f"name = '{safe}' and '{parent_id}' in parents "
+         "and mimeType = 'application/vnd.google-apps.folder' and trashed = false")
+    r = requests.get("https://www.googleapis.com/drive/v3/files",
+                     params={"q": q, "fields": "files(id,name)", "spaces": "drive"},
+                     headers=_drive_headers(token))
+    files = r.json().get("files", [])
+    return files[0]["id"] if files else None
+
+def _drive_create_folder(name: str, parent_id: str, token: str) -> str:
+    r = requests.post("https://www.googleapis.com/drive/v3/files",
+                      headers={**_drive_headers(token), "Content-Type": "application/json"},
+                      json={"name": name, "mimeType": "application/vnd.google-apps.folder", "parents": [parent_id]})
+    data = r.json()
+    if "id" not in data:
+        raise RuntimeError(f"create folder failed: {data}")
+    return data["id"]
+
+def _resolve_path(path: str, root_id: str, token: str, cache: dict) -> str:
+    """Resolve (creating if needed) a 'a/b/c' path to a Drive folder id, under root_id."""
+    if path in cache:
+        return cache[path]
+    parent = root_id
+    cur = ""
+    for part in [p for p in path.split("/") if p]:
+        cur = f"{cur}/{part}" if cur else part
+        if cur in cache:
+            parent = cache[cur]
+            continue
+        fid = _drive_find_folder(part, parent, token) or _drive_create_folder(part, parent, token)
+        cache[cur] = fid
+        parent = fid
+    cache[path] = parent
+    return parent
+
+def _drive_move(file_id: str, add_parent: str, token: str):
+    g = requests.get(f"https://www.googleapis.com/drive/v3/files/{file_id}",
+                     params={"fields": "parents"}, headers=_drive_headers(token))
+    old = ",".join(g.json().get("parents", []))
+    r = requests.patch(f"https://www.googleapis.com/drive/v3/files/{file_id}",
+                       params={"addParents": add_parent, "removeParents": old, "fields": "id,parents"},
+                       headers=_drive_headers(token))
+    if r.status_code != 200:
+        raise RuntimeError(f"move failed http {r.status_code}: {r.text[:150]}")
+
+class PushRequest(BaseModel):
+    client_id: str
+    google_access_token: str
+    root_folder_id: str
+    moves: list  # [{"drive_file_id":..., "target_path":..., "name":...}]
+
+def _run_push(req: PushRequest):
+    cache: dict = {}
+    total = len(req.moves)
+    done = 0
+    errors = 0
+    last_error = ""
+
+    def status():
+        firestore_patch(f"pushStatus/{req.client_id}", {
+            "running": (done + errors) < total,
+            "total": total, "done": done, "errors": errors,
+            "lastError": last_error[:300],
+            "updatedAt": datetime.utcnow().isoformat(),
+        })
+
+    status()
+    for m in req.moves:
+        try:
+            target_id = _resolve_path(m["target_path"], req.root_folder_id, req.google_access_token, cache)
+            _drive_move(m["drive_file_id"], target_id, req.google_access_token)
+            done += 1
+        except Exception as e:
+            errors += 1
+            last_error = f"{m.get('name', '?')}: {e}"
+            print(f"Push error: {last_error}")
+        status()
+
+@app.post("/push-to-drive")
+def push_to_drive(req: PushRequest, background_tasks: BackgroundTasks):
+    """Move files in the client's real Drive to mirror the in-app structure.
+    Runs in background; frontend polls pushStatus/{client_id}."""
+    background_tasks.add_task(_run_push, req)
+    return {"started": True, "to_move": len(req.moves)}
+
+
 class BuildReelRequest(BaseModel):
     client_id: str
     brief: str  # e.g. "high energy fitness reel, talking hook + 3 action b-rolls"
