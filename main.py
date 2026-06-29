@@ -501,6 +501,10 @@ def _run_push(req: PushRequest):
         try:
             target_id = _resolve_path(m["target_path"], req.root_folder_id, req.google_access_token, cache)
             _drive_move(m["drive_file_id"], target_id, req.google_access_token)
+            # Settle the clip: its real Drive location is now target_path, so it
+            # won't be re-pushed next time. Clear the pending organizedPath.
+            if m.get("clip_id"):
+                firestore_patch(f"clips/{m['clip_id']}", {"path": m["target_path"], "organizedPath": ""})
             done += 1
         except Exception as e:
             errors += 1
