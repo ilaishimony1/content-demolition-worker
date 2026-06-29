@@ -473,18 +473,39 @@ def _resolve_path(path: str, root_id: str, token: str, cache: dict) -> str:
 def _drive_move(file_id: str, add_parent: str, token: str):
     g = requests.get(f"https://www.googleapis.com/drive/v3/files/{file_id}",
                      params={"fields": "parents"}, headers=_drive_headers(token))
-    old = ",".join(g.json().get("parents", []))
+    parents = g.json().get("parents", [])
+    if add_parent in parents:
+        return  # already in the home folder — nothing to move
+    old = ",".join(parents)
     r = requests.patch(f"https://www.googleapis.com/drive/v3/files/{file_id}",
                        params={"addParents": add_parent, "removeParents": old, "fields": "id,parents"},
                        headers=_drive_headers(token))
     if r.status_code != 200:
         raise RuntimeError(f"move failed http {r.status_code}: {r.text[:150]}")
 
+def _drive_create_shortcut(file_id: str, name: str, parent_id: str, token: str):
+    """Create a Drive shortcut to file_id inside parent_id (skip if one already there)."""
+    # already linked here?
+    q = (f"'{parent_id}' in parents and trashed = false "
+         "and mimeType = 'application/vnd.google-apps.shortcut'")
+    existing = requests.get("https://www.googleapis.com/drive/v3/files",
+                            params={"q": q, "fields": "files(id,shortcutDetails)"},
+                            headers=_drive_headers(token)).json().get("files", [])
+    for sc in existing:
+        if (sc.get("shortcutDetails") or {}).get("targetId") == file_id:
+            return  # shortcut already exists
+    r = requests.post("https://www.googleapis.com/drive/v3/files",
+                      headers={**_drive_headers(token), "Content-Type": "application/json"},
+                      json={"name": name, "mimeType": "application/vnd.google-apps.shortcut",
+                            "parents": [parent_id], "shortcutDetails": {"targetId": file_id}})
+    if r.status_code not in (200, 201):
+        raise RuntimeError(f"shortcut failed http {r.status_code}: {r.text[:120]}")
+
 class PushRequest(BaseModel):
     client_id: str
     google_access_token: str
     root_folder_id: str
-    moves: list  # [{"drive_file_id":..., "target_path":..., "name":...}]
+    moves: list  # [{"drive_file_id":..., "target_path":..., "extra_paths":[], "name":..., "clip_id":...}]
 
 def _run_push(req: PushRequest):
     cache: dict = {}
@@ -506,6 +527,10 @@ def _run_push(req: PushRequest):
         try:
             target_id = _resolve_path(m["target_path"], req.root_folder_id, req.google_access_token, cache)
             _drive_move(m["drive_file_id"], target_id, req.google_access_token)
+            # Multi-folder: create a shortcut in each "also add" folder
+            for extra in (m.get("extra_paths") or []):
+                extra_id = _resolve_path(extra, req.root_folder_id, req.google_access_token, cache)
+                _drive_create_shortcut(m["drive_file_id"], m.get("name", "clip"), extra_id, req.google_access_token)
             # Settle the clip: its real Drive location is now target_path, so it
             # won't be re-pushed next time. Clear the pending organizedPath.
             if m.get("clip_id"):
