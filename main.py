@@ -132,43 +132,48 @@ def extract_frames(video_url: str, num_frames: int = 3, extra_headers: dict = {}
         except:
             pass
 
-        # ── 2a: fast seek-based extraction (input seek) — works for most files ──
-        timestamps = [0.5, min(2.0, duration * 0.1), duration * 0.5, duration * 0.85]
-        last_ffmpeg_err = ""
-        for i, ts in enumerate(timestamps[:num_frames]):
-            frame_path = os.path.join(tmp, f"frame_{i}.jpg")
-            proc = subprocess.run([
-                "ffmpeg", "-ss", str(ts), "-i", video_path,
-                "-vframes", "1", "-q:v", "3", "-vf", "scale=512:-1",
-                "-an", frame_path, "-y"
-            ], capture_output=True, text=True)
-            if proc.returncode != 0:
-                last_ffmpeg_err = (proc.stderr or "")[-150:]
-            if os.path.exists(frame_path):
-                with open(frame_path, "rb") as f:
+        err_holder = [""]
+        # -nostdin prevents the interactive "Press [q]" hang; DEVNULL stdin too.
+        def run_ff(args):
+            p = subprocess.run(["ffmpeg", "-nostdin", "-y", *args],
+                               capture_output=True, text=True, stdin=subprocess.DEVNULL)
+            if p.returncode != 0:
+                err = p.stderr or ""
+                # surface a REAL error line if present, else the tail
+                lines = [ln for ln in err.splitlines()
+                         if any(k in ln.lower() for k in ("error", "invalid", "could not", "no such", "killed", "unable", "failed"))]
+                err_holder[0] = (lines[-1] if lines else err[-160:]).strip()
+            return p
+
+        def collect(prefix):
+            for fp in sorted(os.path.join(tmp, f) for f in os.listdir(tmp) if f.startswith(prefix)):
+                with open(fp, "rb") as f:
                     frames.append(base64.b64encode(f.read()).decode())
 
-        # ── 2b: robust fallback — single sequential decode pass. Handles iPhone
-        # Dolby Vision / HEVC HDR clips that the fast seek method can't grab. ──
+        # ── 2a: fast input-seek per timestamp (only reliable if duration is real) ──
+        have_duration = duration and duration > 1.5
+        if have_duration:
+            timestamps = [0.5, min(2.0, duration * 0.1), duration * 0.5, duration * 0.85]
+            for i, ts in enumerate(timestamps[:num_frames]):
+                run_ff(["-ss", str(ts), "-i", video_path, "-frames:v", "1",
+                        "-q:v", "3", "-vf", "scale=512:-1", "-an", os.path.join(tmp, f"a_{i}.jpg")])
+            collect("a_")
+
+        # ── 2b: representative frames via thumbnail filter — NO duration dependency.
+        # Handles Dolby Vision / short clips where ffprobe couldn't read duration. ──
         if not frames:
-            interval = max(0.5, duration / (num_frames + 1))
-            out_pattern = os.path.join(tmp, "seq_%02d.jpg")
-            proc = subprocess.run([
-                "ffmpeg", "-i", video_path,
-                "-vf", f"fps=1/{interval:.3f},scale=512:-1",
-                "-frames:v", str(num_frames), "-q:v", "3", "-an",
-                out_pattern, "-y"
-            ], capture_output=True, text=True)
-            if proc.returncode != 0:
-                last_ffmpeg_err = (proc.stderr or "")[-150:]
-            for i in range(1, num_frames + 1):
-                fp = os.path.join(tmp, f"seq_{i:02d}.jpg")
-                if os.path.exists(fp):
-                    with open(fp, "rb") as f:
-                        frames.append(base64.b64encode(f.read()).decode())
+            run_ff(["-i", video_path, "-vf", "scale=512:-1,thumbnail=120",
+                    "-frames:v", str(num_frames), "-q:v", "3", "-an", os.path.join(tmp, "b_%02d.jpg")])
+            collect("b_")
+
+        # ── 2c: last resort — first decodable frame from the very start (no seek). ──
+        if not frames:
+            run_ff(["-i", video_path, "-frames:v", "1", "-q:v", "3",
+                    "-vf", "scale=512:-1", "-an", os.path.join(tmp, "c_0.jpg")])
+            collect("c_")
 
         if not frames:
-            raise RuntimeError(f"FFMPEG_FAILED no frames: {last_ffmpeg_err or 'unknown'}")
+            raise RuntimeError(f"FFMPEG_FAILED no frames: {err_holder[0] or 'unknown'}")
 
     return frames
 
