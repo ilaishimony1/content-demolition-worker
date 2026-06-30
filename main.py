@@ -247,6 +247,38 @@ def health():
         "agents": ["video-analyser", "drive-scanner", "reel-builder", "auto-poster"],
     }
 
+@app.get("/test-reel")
+def test_reel(url: str):
+    """De-risk test: can we download an IG reel from its link? Browser-friendly GET.
+    Returns whether yt-dlp fetched the video + size + caption, or the error."""
+    import shutil
+    if not shutil.which("yt-dlp"):
+        return {"ok": False, "error": "yt-dlp not installed yet (redeploy)"}
+    with tempfile.TemporaryDirectory() as tmp:
+        out = os.path.join(tmp, "reel.%(ext)s")
+        try:
+            proc = subprocess.run(
+                ["yt-dlp", "--no-playlist", "-f", "mp4/best", "--print-json",
+                 "-o", out, url],
+                capture_output=True, text=True, timeout=120
+            )
+        except Exception as e:
+            return {"ok": False, "error": f"yt-dlp crashed: {str(e)[:200]}"}
+        files = [f for f in os.listdir(tmp)]
+        got = next((f for f in files if not f.endswith(".json")), None)
+        if not got:
+            return {"ok": False, "error": "download failed", "detail": (proc.stderr or "")[-400:]}
+        size_mb = round(os.path.getsize(os.path.join(tmp, got)) / 1024 / 1024, 1)
+        # try to read caption/duration from the printed json
+        caption, duration = "", None
+        try:
+            meta = json.loads((proc.stdout or "").strip().splitlines()[-1])
+            caption = (meta.get("description") or "")[:200]
+            duration = meta.get("duration")
+        except Exception:
+            pass
+        return {"ok": True, "downloaded": got, "size_mb": size_mb, "duration_sec": duration, "caption": caption}
+
 class AnalyseVideoRequest(BaseModel):
     video_url: str
     caption: Optional[str] = ""
