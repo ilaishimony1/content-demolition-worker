@@ -582,21 +582,177 @@ def push_to_drive(req: PushRequest, background_tasks: BackgroundTasks):
     return {"started": True, "to_move": len(req.moves)}
 
 
+class BuildReelClip(BaseModel):
+    name: Optional[str] = ""
+    driveFileId: Optional[str] = None
+    driveUrl: Optional[str] = None
+    bunnyUrl: Optional[str] = None
+    downloadUrl: Optional[str] = None
+
 class BuildReelRequest(BaseModel):
     client_id: str
-    brief: str  # e.g. "high energy fitness reel, talking hook + 3 action b-rolls"
-    clip_ids: Optional[list[str]] = None  # specific clips, or auto-select
+    client_name: Optional[str] = ""
+    title: Optional[str] = "AI rough cut"
+    source_url: Optional[str] = ""       # the original reel being modelled
+    google_access_token: Optional[str] = None
+    root_folder_id: Optional[str] = None # client Drive root — output goes in a subfolder
+    clips: list[BuildReelClip] = []
+    clip_seconds: float = 2.0            # how long to keep from each clip
+
+
+def _clip_download_url(clip: BuildReelClip, token: Optional[str]) -> Optional[str]:
+    url = clip.bunnyUrl or clip.driveUrl or clip.downloadUrl
+    if not url and clip.driveFileId and token:
+        url = f"https://www.googleapis.com/drive/v3/files/{clip.driveFileId}?alt=media"
+    return url
+
+
+def _drive_upload(name: str, parent_id: str, filepath: str, token: str, mime: str = "video/mp4") -> dict:
+    """Multipart-upload a local file into a Drive folder. Returns {id, webViewLink}."""
+    with open(filepath, "rb") as f:
+        data = f.read()
+    boundary = "cdsreelboundary"
+    meta = json.dumps({"name": name, "parents": [parent_id]})
+    body = (
+        f"--{boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n{meta}\r\n"
+        f"--{boundary}\r\nContent-Type: {mime}\r\n\r\n"
+    ).encode() + data + f"\r\n--{boundary}--".encode()
+    r = requests.post(
+        "https://www.googleapis.com/upload/drive/v3/files",
+        params={"uploadType": "multipart", "fields": "id,webViewLink,webContentLink"},
+        headers={"Authorization": f"Bearer {token}", "Content-Type": f"multipart/related; boundary={boundary}"},
+        data=body, timeout=300,
+    )
+    return r.json()
+
+
+def _run_build_reel(req: BuildReelRequest):
+    """Download the chosen clips, trim + normalise each, concat into a silent 9:16
+    rough cut, upload it to the client's Drive, and drop a draft into the
+    Production Queue (reels). Music + captions are added 1:1 by the editor after."""
+    cid = req.client_id
+    total = len(req.clips)
+
+    def status(**extra):
+        firestore_patch(f"buildStatus/{cid}", {
+            "running": extra.get("running", True),
+            "total": total,
+            "done": extra.get("done", 0),
+            "stage": extra.get("stage", ""),
+            "error": extra.get("error", ""),
+            "videoUrl": extra.get("videoUrl", ""),
+            "updatedAt": datetime.utcnow().isoformat(),
+        })
+
+    if total == 0:
+        status(running=False, error="No clips selected")
+        return
+
+    status(stage="starting")
+    workdir = tempfile.mkdtemp(prefix="reel_")
+    segments = []
+    try:
+        for i, clip in enumerate(req.clips):
+            url = _clip_download_url(clip, req.google_access_token)
+            if not url:
+                continue
+            headers = {}
+            if "googleapis.com" in url and req.google_access_token:
+                headers["Authorization"] = f"Bearer {req.google_access_token}"
+            raw = os.path.join(workdir, f"raw_{i}.mp4")
+            seg = os.path.join(workdir, f"seg_{i}.mp4")
+            status(stage=f"downloading clip {i+1}/{total}", done=i)
+            try:
+                with requests.get(url, stream=True, timeout=300, headers=headers) as resp:
+                    resp.raise_for_status()
+                    with open(raw, "wb") as fh:
+                        for chunk in resp.iter_content(chunk_size=1 << 20):
+                            fh.write(chunk)
+            except Exception as e:
+                print(f"[build-reel] download failed {clip.name}: {e}")
+                continue
+            # Trim first N seconds, crop-fill to vertical 1080x1920, 30fps, silent, uniform codec.
+            status(stage=f"trimming clip {i+1}/{total}", done=i)
+            vf = "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,fps=30,setsar=1"
+            proc = subprocess.run(
+                ["ffmpeg", "-y", "-nostdin", "-i", raw, "-t", str(req.clip_seconds),
+                 "-vf", vf, "-an", "-c:v", "libx264", "-preset", "veryfast",
+                 "-pix_fmt", "yuv420p", "-movflags", "+faststart", seg],
+                stdin=subprocess.DEVNULL, capture_output=True, text=True,
+            )
+            if os.path.exists(seg) and os.path.getsize(seg) > 0:
+                segments.append(seg)
+            else:
+                print(f"[build-reel] ffmpeg trim failed {clip.name}: {proc.stderr[-400:]}")
+
+        if not segments:
+            status(running=False, error="Could not process any clips")
+            return
+
+        # Concat the uniform segments (same codec params → stream copy is safe).
+        status(stage="stitching")
+        listfile = os.path.join(workdir, "list.txt")
+        with open(listfile, "w") as fh:
+            for s in segments:
+                fh.write(f"file '{s}'\n")
+        out = os.path.join(workdir, "rough_cut.mp4")
+        cat = subprocess.run(
+            ["ffmpeg", "-y", "-nostdin", "-f", "concat", "-safe", "0", "-i", listfile,
+             "-c", "copy", "-movflags", "+faststart", out],
+            stdin=subprocess.DEVNULL, capture_output=True, text=True,
+        )
+        if not (os.path.exists(out) and os.path.getsize(out) > 0):
+            # Fallback: re-encode concat if stream copy failed.
+            cat = subprocess.run(
+                ["ffmpeg", "-y", "-nostdin", "-f", "concat", "-safe", "0", "-i", listfile,
+                 "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p",
+                 "-movflags", "+faststart", out],
+                stdin=subprocess.DEVNULL, capture_output=True, text=True,
+            )
+        if not (os.path.exists(out) and os.path.getsize(out) > 0):
+            status(running=False, error=f"Stitch failed: {cat.stderr[-300:]}")
+            return
+
+        # Upload the rough cut to Drive and register it in the Production Queue.
+        video_url = ""
+        if req.google_access_token and req.root_folder_id:
+            status(stage="uploading")
+            cache = {}
+            folder_id = _resolve_path("🎬 AI Rough Cuts", req.root_folder_id, req.google_access_token, cache)
+            fname = f"{(req.title or 'rough_cut').replace('/', '-')} {datetime.utcnow().strftime('%Y-%m-%d %H%M')}.mp4"
+            up = _drive_upload(fname, folder_id, out, req.google_access_token)
+            video_url = up.get("webViewLink", "")
+
+        import uuid
+        reel_id = uuid.uuid4().hex[:20]
+        firestore_create("reels", reel_id, {
+            "clientId": cid,
+            "clientName": req.client_name or "",
+            "title": req.title or "AI rough cut",
+            "caption": f"Modelled from {req.source_url}" if req.source_url else "",
+            "videoUrl": video_url,
+            "status": "pending",
+            "source": "ai-rough-cut",
+            "createdAt": datetime.utcnow().isoformat(),
+        })
+        status(running=False, done=total, stage="done", videoUrl=video_url)
+    except Exception as e:
+        print(f"[build-reel] fatal: {e}")
+        status(running=False, error=str(e)[:300])
+    finally:
+        try:
+            import shutil
+            shutil.rmtree(workdir, ignore_errors=True)
+        except Exception:
+            pass
+
 
 @app.post("/build-reel")
-def build_reel(req: BuildReelRequest):
-    """Select clips based on brief and assemble a reel with FFmpeg."""
-    # TODO: implement full reel building
-    # For now returns the plan
-    return {
-        "status": "coming_soon",
-        "message": "Reel builder agent is being built",
-        "brief": req.brief
-    }
+def build_reel(req: BuildReelRequest, background_tasks: BackgroundTasks):
+    """Assemble a silent 9:16 rough cut from the chosen clips. Runs in background;
+    frontend polls buildStatus/{client_id}. Editor adds 1:1 music + captions after."""
+    background_tasks.add_task(_run_build_reel, req)
+    return {"started": True, "clips": len(req.clips)}
 
 class AnalyseIGPostRequest(BaseModel):
     video_url: str
