@@ -651,28 +651,39 @@ def _run_build_reel(req: BuildReelRequest):
     status(stage="starting")
     workdir = tempfile.mkdtemp(prefix="reel_")
     segments = []
+    last_err = ""
     try:
         for i, clip in enumerate(req.clips):
             url = _clip_download_url(clip, req.google_access_token)
             if not url:
+                last_err = f"{clip.name}: no download URL (driveFileId={clip.driveFileId}, token={bool(req.google_access_token)})"
                 continue
             headers = {}
             if "googleapis.com" in url and req.google_access_token:
                 headers["Authorization"] = f"Bearer {req.google_access_token}"
             raw = os.path.join(workdir, f"raw_{i}.mp4")
             seg = os.path.join(workdir, f"seg_{i}.mp4")
-            status(stage=f"downloading clip {i+1}/{total}", done=i)
+            status(stage=f"downloading clip {i+1}/{total}", done=i, error=last_err)
             try:
                 with requests.get(url, stream=True, timeout=300, headers=headers) as resp:
-                    resp.raise_for_status()
+                    if resp.status_code != 200:
+                        last_err = f"{clip.name}: download HTTP {resp.status_code} — {resp.text[:150]}"
+                        print(f"[build-reel] {last_err}")
+                        continue
                     with open(raw, "wb") as fh:
                         for chunk in resp.iter_content(chunk_size=1 << 20):
                             fh.write(chunk)
             except Exception as e:
-                print(f"[build-reel] download failed {clip.name}: {e}")
+                last_err = f"{clip.name}: download error {e}"
+                print(f"[build-reel] {last_err}")
+                continue
+            size = os.path.getsize(raw) if os.path.exists(raw) else 0
+            if size < 1000:
+                last_err = f"{clip.name}: downloaded only {size} bytes (likely not a video)"
+                print(f"[build-reel] {last_err}")
                 continue
             # Trim first N seconds, crop-fill to vertical 1080x1920, 30fps, silent, uniform codec.
-            status(stage=f"trimming clip {i+1}/{total}", done=i)
+            status(stage=f"trimming clip {i+1}/{total}", done=i, error=last_err)
             vf = "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,fps=30,setsar=1"
             proc = subprocess.run(
                 ["ffmpeg", "-y", "-nostdin", "-i", raw, "-t", str(req.clip_seconds),
@@ -683,10 +694,11 @@ def _run_build_reel(req: BuildReelRequest):
             if os.path.exists(seg) and os.path.getsize(seg) > 0:
                 segments.append(seg)
             else:
-                print(f"[build-reel] ffmpeg trim failed {clip.name}: {proc.stderr[-400:]}")
+                last_err = f"{clip.name}: ffmpeg trim failed — {proc.stderr[-200:]}"
+                print(f"[build-reel] {last_err}")
 
         if not segments:
-            status(running=False, error="Could not process any clips")
+            status(running=False, error=f"Could not process any clips. Last: {last_err}")
             return
 
         # Concat the uniform segments (same codec params → stream copy is safe).
