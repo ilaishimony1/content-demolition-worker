@@ -966,10 +966,10 @@ Return ONLY a JSON object with this exact shape:
     {{"start": <seconds>, "end": <seconds>, "why": "<one line in Hebrew or English>", "quote": "<the Hebrew quote>", "rank": <1 = best>}}
   ],
   "keep": [
-    {{"start": <seconds>, "end": <seconds>, "why": "<one line>"}}
+    {{"start": <seconds>, "end": <seconds>, "why": "<one line>", "quote": "<a short representative Hebrew quote from this segment>"}}
   ],
   "cut": [
-    {{"start": <seconds>, "end": <seconds>, "why": "<one line>"}}
+    {{"start": <seconds>, "end": <seconds>, "why": "<one line>", "quote": "<a short representative Hebrew quote from this segment>"}}
   ]
 }}
 
