@@ -973,9 +973,21 @@ Return ONLY a JSON object with this exact shape:
   ]
 }}
 
-Cover the full episode — every segment should fall into exactly one of gold/keep/cut. Aim for 5-10 gold
-moments if the content supports it; don't force it if the episode is weak. Merge adjacent segments that
-belong to the same moment into one range."""
+CRITICAL — scan the ENTIRE episode from the first timestamp to the very last one. Find EVERY gold moment
+across the whole runtime, not just the beginning. A long episode (60+ min) can have 15-30 gold moments
+spread throughout — do not stop early or focus only on the opening.
+
+For GOLD: each is a self-contained "nugget" — starts on the hook (the punchy line), ends where that
+specific idea/story pays off. Bias tight; most are 20-90 seconds; only a full pure-gold story goes up to
+~150 seconds max. Do NOT extend a clip to a whole subject — a 10-minute topic yields one tight nugget, not
+10 minutes. Rank gold best-first.
+
+For KEEP: solid supporting context, a representative sample (doesn't need to be exhaustive).
+
+For CUT: give only 5-10 REPRESENTATIVE examples of filler/rambling/tangents — do NOT try to list every
+non-gold second of the episode. The rest of the runtime is implicitly cut; we only care that gold is complete.
+
+Merge adjacent segments that belong to the same moment into one range."""
 
 
 class TriagePodcastRequest(BaseModel):
@@ -1002,7 +1014,7 @@ def triage_podcast(req: TriagePodcastRequest):
     try:
         msg = claude.messages.create(
             model="claude-sonnet-4-6",
-            max_tokens=4000,
+            max_tokens=8000,
             messages=[{"role": "user", "content": TRIAGE_PROMPT.format(transcript=transcript_text)}],
         )
         raw = msg.content[0].text if msg.content and msg.content[0].type == "text" else "{}"
