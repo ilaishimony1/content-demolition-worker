@@ -786,3 +786,235 @@ def analyse_ig_post(req: AnalyseIGPostRequest):
 
     except Exception as e:
         return {"success": False, "error": str(e), "post_id": req.post_id}
+
+
+# ─── Podcast Engine: Hebrew transcription (Whisper via Groq) ──────────────────
+
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
+
+class TranscribePodcastRequest(BaseModel):
+    client_id: str
+    episode_id: str                       # our own id for this episode (used as doc id)
+    google_access_token: str
+    drive_file_id: Optional[str] = None
+    drive_file_name: Optional[str] = None # fallback: find by name (searches whole Drive)
+    episode_title: Optional[str] = ""
+
+
+def _drive_find_file_by_name(name: str, token: str) -> Optional[str]:
+    safe = name.replace("\\", "\\\\").replace("'", "\\'")
+    q = f"name contains '{safe}' and trashed = false"
+    r = requests.get("https://www.googleapis.com/drive/v3/files",
+                     params={"q": q, "fields": "files(id,name)", "spaces": "drive"},
+                     headers=_drive_headers(token))
+    files = r.json().get("files", [])
+    return files[0]["id"] if files else None
+
+
+def _groq_transcribe_chunk(filepath: str) -> dict:
+    """Send one audio chunk to Groq's Whisper endpoint (OpenAI-compatible). Returns verbose_json."""
+    with open(filepath, "rb") as f:
+        r = requests.post(
+            "https://api.groq.com/openai/v1/audio/transcriptions",
+            headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
+            files={"file": (os.path.basename(filepath), f, "audio/mpeg")},
+            data={"model": "whisper-large-v3", "language": "he", "response_format": "verbose_json"},
+            timeout=300,
+        )
+    if r.status_code != 200:
+        raise RuntimeError(f"Groq transcription failed: {r.status_code} {r.text[:300]}")
+    return r.json()
+
+
+def _run_transcribe_podcast(req: TranscribePodcastRequest):
+    """Download the episode, strip + chunk the audio, transcribe each chunk via Groq Whisper,
+    stitch into one timestamped Hebrew transcript, save to Firestore. Runs in background;
+    frontend polls transcribeStatus/{episode_id}."""
+    eid = req.episode_id
+
+    def status(**extra):
+        firestore_patch(f"transcribeStatus/{eid}", {
+            "running": extra.get("running", True),
+            "stage": extra.get("stage", ""),
+            "error": extra.get("error", ""),
+            "chunksDone": extra.get("chunksDone", 0),
+            "chunksTotal": extra.get("chunksTotal", 0),
+            "updatedAt": datetime.utcnow().isoformat(),
+        })
+
+    if not GROQ_API_KEY:
+        status(running=False, error="GROQ_API_KEY not set on the worker")
+        return
+
+    status(stage="resolving file")
+    file_id = req.drive_file_id
+    if not file_id and req.drive_file_name:
+        file_id = _drive_find_file_by_name(req.drive_file_name, req.google_access_token)
+    if not file_id:
+        status(running=False, error="Could not find the Drive file (no id, name not found)")
+        return
+
+    workdir = tempfile.mkdtemp(prefix="podcast_")
+    try:
+        # Download the raw video from Drive.
+        status(stage="downloading episode")
+        video_path = os.path.join(workdir, "episode.mp4")
+        url = f"https://www.googleapis.com/drive/v3/files/{file_id}?alt=media"
+        headers = {"Authorization": f"Bearer {req.google_access_token}"}
+        with requests.get(url, stream=True, headers=headers, timeout=600) as resp:
+            if resp.status_code != 200:
+                status(running=False, error=f"Drive download failed: HTTP {resp.status_code} — {resp.text[:200]}")
+                return
+            with open(video_path, "wb") as fh:
+                for chunk in resp.iter_content(chunk_size=1 << 20):
+                    fh.write(chunk)
+
+        # Strip audio only, mono, low bitrate — keeps chunks well under the 25MB API cap.
+        status(stage="extracting audio")
+        audio_path = os.path.join(workdir, "audio.mp3")
+        proc = subprocess.run(
+            ["ffmpeg", "-y", "-nostdin", "-i", video_path, "-vn",
+             "-ac", "1", "-ar", "16000", "-b:a", "64k", audio_path],
+            stdin=subprocess.DEVNULL, capture_output=True, text=True,
+        )
+        if not (os.path.exists(audio_path) and os.path.getsize(audio_path) > 0):
+            status(running=False, error=f"Audio extraction failed: {proc.stderr[-300:]}")
+            return
+
+        # Split into ~10-min chunks (well under Groq's 25MB/file limit at 64kbps mono).
+        status(stage="chunking audio")
+        chunk_pattern = os.path.join(workdir, "chunk_%03d.mp3")
+        subprocess.run(
+            ["ffmpeg", "-y", "-nostdin", "-i", audio_path,
+             "-f", "segment", "-segment_time", "600", "-c", "copy", chunk_pattern],
+            stdin=subprocess.DEVNULL, capture_output=True, text=True,
+        )
+        chunks = sorted(f for f in os.listdir(workdir) if f.startswith("chunk_"))
+        if not chunks:
+            status(running=False, error="No audio chunks produced")
+            return
+
+        # Transcribe each chunk, offsetting segment timestamps by the chunk's start time.
+        all_segments = []
+        for i, chunk_name in enumerate(chunks):
+            status(stage=f"transcribing chunk {i+1}/{len(chunks)}", chunksDone=i, chunksTotal=len(chunks))
+            chunk_offset = i * 600  # seconds
+            try:
+                result = _groq_transcribe_chunk(os.path.join(workdir, chunk_name))
+                for seg in result.get("segments", []):
+                    all_segments.append({
+                        "start": round(seg["start"] + chunk_offset, 1),
+                        "end": round(seg["end"] + chunk_offset, 1),
+                        "text": seg["text"].strip(),
+                    })
+            except Exception as e:
+                print(f"[transcribe-podcast] chunk {chunk_name} failed: {e}")
+                status(stage=f"chunk {i+1} failed, continuing", chunksDone=i, chunksTotal=len(chunks),
+                       error=f"chunk {i+1}: {e}")
+
+        if not all_segments:
+            status(running=False, error="Transcription produced no segments")
+            return
+
+        full_text = " ".join(s["text"] for s in all_segments)
+        firestore_patch(f"podcastTranscripts/{eid}", {
+            "clientId": req.client_id,
+            "episodeTitle": req.episode_title or "",
+            "driveFileId": file_id,
+            "segments": json.dumps(all_segments, ensure_ascii=False),
+            "fullText": full_text,
+            "segmentCount": len(all_segments),
+            "transcribedAt": datetime.utcnow().isoformat(),
+        })
+        status(running=False, stage="done", chunksDone=len(chunks), chunksTotal=len(chunks))
+    except Exception as e:
+        print(f"[transcribe-podcast] fatal: {e}")
+        status(running=False, error=str(e)[:300])
+    finally:
+        try:
+            import shutil
+            shutil.rmtree(workdir, ignore_errors=True)
+        except Exception:
+            pass
+
+
+@app.post("/transcribe-podcast")
+def transcribe_podcast(req: TranscribePodcastRequest, background_tasks: BackgroundTasks):
+    """Kick off background transcription of a podcast episode (Hebrew, via Groq Whisper).
+    Frontend polls transcribeStatus/{episode_id}; result lands in podcastTranscripts/{episode_id}."""
+    background_tasks.add_task(_run_transcribe_podcast, req)
+    return {"started": True, "episode_id": req.episode_id}
+
+
+# ─── Podcast Engine: triage (Claude decides gold / keep / cut) ────────────────
+
+TRIAGE_PROMPT = """You are triaging a Hebrew business/sales podcast episode hosted by Nimrod Avdala
+("הפרלמנט של נמרוד"), CEO of Nova (outsourced sales). The goal: find the moments worth turning into
+short Instagram reels, and flag what's just filler.
+
+"Gold" for this show means: a strong sales/business insight, a real personal story, a punchy quotable
+one-liner, or an emotional/authentic beat — something that could stand alone as a 30-60s reel.
+"Cut" means: filler words, rambling tangents, dead air, small talk unrelated to the topic, repeated points.
+"Keep" is everything solid but not standout — useful for a tighter full episode, not reel-worthy alone.
+
+Here is the timestamped transcript (seconds):
+{transcript}
+
+Return ONLY a JSON object with this exact shape:
+{{
+  "gold": [
+    {{"start": <seconds>, "end": <seconds>, "why": "<one line in Hebrew or English>", "quote": "<the Hebrew quote>", "rank": <1 = best>}}
+  ],
+  "keep": [
+    {{"start": <seconds>, "end": <seconds>, "why": "<one line>"}}
+  ],
+  "cut": [
+    {{"start": <seconds>, "end": <seconds>, "why": "<one line>"}}
+  ]
+}}
+
+Cover the full episode — every segment should fall into exactly one of gold/keep/cut. Aim for 5-10 gold
+moments if the content supports it; don't force it if the episode is weak. Merge adjacent segments that
+belong to the same moment into one range."""
+
+
+class TriagePodcastRequest(BaseModel):
+    episode_id: str
+
+
+def _fmt_transcript_for_claude(segments: list) -> str:
+    lines = [f"[{s['start']}-{s['end']}] {s['text']}" for s in segments]
+    return "\n".join(lines)
+
+
+@app.post("/triage-podcast")
+def triage_podcast(req: TriagePodcastRequest):
+    """Read the saved transcript and ask Claude to produce the gold/keep/cut triage map.
+    Synchronous (transcript analysis is a single fast call) — saves to podcastTriage/{episode_id}."""
+    doc = firestore_get(f"podcastTranscripts/{req.episode_id}")
+    data = parse_fs_doc(doc)
+    if not data or "segments" not in data:
+        raise HTTPException(status_code=404, detail="No transcript found for this episode_id")
+
+    segments = json.loads(data["segments"])
+    transcript_text = _fmt_transcript_for_claude(segments)
+
+    try:
+        msg = claude.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=4000,
+            messages=[{"role": "user", "content": TRIAGE_PROMPT.format(transcript=transcript_text)}],
+        )
+        raw = msg.content[0].text if msg.content and msg.content[0].type == "text" else "{}"
+        m = re.search(r"\{[\s\S]*\}", raw)
+        triage = json.loads(m.group(0)) if m else {"gold": [], "keep": [], "cut": []}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Triage failed: {e}")
+
+    firestore_patch(f"podcastTriage/{req.episode_id}", {
+        "gold": json.dumps(triage.get("gold", []), ensure_ascii=False),
+        "keep": json.dumps(triage.get("keep", []), ensure_ascii=False),
+        "cut": json.dumps(triage.get("cut", []), ensure_ascii=False),
+        "triagedAt": datetime.utcnow().isoformat(),
+    })
+    return {"success": True, "episode_id": req.episode_id, "triage": triage}
