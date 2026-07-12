@@ -790,7 +790,7 @@ def analyse_ig_post(req: AnalyseIGPostRequest):
 
 # ─── Podcast Engine: Hebrew transcription (Whisper via Groq) ──────────────────
 
-GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
+DEEPGRAM_API_KEY = os.environ.get("DEEPGRAM_API_KEY", "")
 
 class TranscribePodcastRequest(BaseModel):
     client_id: str
@@ -811,25 +811,43 @@ def _drive_find_file_by_name(name: str, token: str) -> Optional[str]:
     return files[0]["id"] if files else None
 
 
-def _groq_transcribe_chunk(filepath: str) -> dict:
-    """Send one audio chunk to Groq's Whisper endpoint (OpenAI-compatible). Returns verbose_json."""
-    with open(filepath, "rb") as f:
-        r = requests.post(
-            "https://api.groq.com/openai/v1/audio/transcriptions",
-            headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
-            files={"file": (os.path.basename(filepath), f, "audio/mpeg")},
-            data={"model": "whisper-large-v3", "language": "he", "response_format": "verbose_json"},
-            timeout=300,
-        )
+def _deepgram_transcribe(audio_path: str) -> list:
+    """Send the whole audio file to Deepgram (Hebrew + speaker diarization) in one call —
+    no manual chunking needed, Deepgram handles long audio directly. Returns a list of
+    {start, end, text, speaker} segments, one per speaker utterance."""
+    with open(audio_path, "rb") as f:
+        audio_bytes = f.read()
+    r = requests.post(
+        "https://api.deepgram.com/v1/listen",
+        params={
+            "language": "he", "diarize": "true", "punctuate": "true",
+            "utterances": "true", "smart_format": "true",
+        },
+        headers={"Authorization": f"Token {DEEPGRAM_API_KEY}", "Content-Type": "audio/mpeg"},
+        data=audio_bytes, timeout=1800,
+    )
     if r.status_code != 200:
-        raise RuntimeError(f"Groq transcription failed: {r.status_code} {r.text[:300]}")
-    return r.json()
+        raise RuntimeError(f"Deepgram transcription failed: {r.status_code} {r.text[:300]}")
+    data = r.json()
+    utterances = data.get("results", {}).get("utterances", [])
+    segments = []
+    for u in utterances:
+        text = (u.get("transcript") or "").strip()
+        if not text:
+            continue
+        segments.append({
+            "start": round(u.get("start", 0), 1),
+            "end": round(u.get("end", 0), 1),
+            "text": text,
+            "speaker": f"Speaker {u.get('speaker', 0) + 1}",
+        })
+    return segments
 
 
 def _run_transcribe_podcast(req: TranscribePodcastRequest):
-    """Download the episode, strip + chunk the audio, transcribe each chunk via Groq Whisper,
-    stitch into one timestamped Hebrew transcript, save to Firestore. Runs in background;
-    frontend polls transcribeStatus/{episode_id}."""
+    """Download the episode, strip audio, transcribe via Deepgram (Hebrew + speaker labels
+    in one pass), save the timestamped transcript to Firestore. Runs in background; frontend
+    polls transcribeStatus/{episode_id}."""
     eid = req.episode_id
 
     def status(**extra):
@@ -837,13 +855,11 @@ def _run_transcribe_podcast(req: TranscribePodcastRequest):
             "running": extra.get("running", True),
             "stage": extra.get("stage", ""),
             "error": extra.get("error", ""),
-            "chunksDone": extra.get("chunksDone", 0),
-            "chunksTotal": extra.get("chunksTotal", 0),
             "updatedAt": datetime.utcnow().isoformat(),
         })
 
-    if not GROQ_API_KEY:
-        status(running=False, error="GROQ_API_KEY not set on the worker")
+    if not DEEPGRAM_API_KEY:
+        status(running=False, error="DEEPGRAM_API_KEY not set on the worker")
         return
 
     status(stage="resolving file")
@@ -869,7 +885,7 @@ def _run_transcribe_podcast(req: TranscribePodcastRequest):
                 for chunk in resp.iter_content(chunk_size=1 << 20):
                     fh.write(chunk)
 
-        # Strip audio only, mono, low bitrate — keeps chunks well under the 25MB API cap.
+        # Strip audio only, mono — Deepgram takes the whole file in one call, no chunking needed.
         status(stage="extracting audio")
         audio_path = os.path.join(workdir, "audio.mp3")
         proc = subprocess.run(
@@ -881,36 +897,12 @@ def _run_transcribe_podcast(req: TranscribePodcastRequest):
             status(running=False, error=f"Audio extraction failed: {proc.stderr[-300:]}")
             return
 
-        # Split into ~10-min chunks (well under Groq's 25MB/file limit at 64kbps mono).
-        status(stage="chunking audio")
-        chunk_pattern = os.path.join(workdir, "chunk_%03d.mp3")
-        subprocess.run(
-            ["ffmpeg", "-y", "-nostdin", "-i", audio_path,
-             "-f", "segment", "-segment_time", "600", "-c", "copy", chunk_pattern],
-            stdin=subprocess.DEVNULL, capture_output=True, text=True,
-        )
-        chunks = sorted(f for f in os.listdir(workdir) if f.startswith("chunk_"))
-        if not chunks:
-            status(running=False, error="No audio chunks produced")
+        status(stage="transcribing with Deepgram (this can take a few minutes)")
+        try:
+            all_segments = _deepgram_transcribe(audio_path)
+        except Exception as e:
+            status(running=False, error=f"Deepgram transcription failed: {e}")
             return
-
-        # Transcribe each chunk, offsetting segment timestamps by the chunk's start time.
-        all_segments = []
-        for i, chunk_name in enumerate(chunks):
-            status(stage=f"transcribing chunk {i+1}/{len(chunks)}", chunksDone=i, chunksTotal=len(chunks))
-            chunk_offset = i * 600  # seconds
-            try:
-                result = _groq_transcribe_chunk(os.path.join(workdir, chunk_name))
-                for seg in result.get("segments", []):
-                    all_segments.append({
-                        "start": round(seg["start"] + chunk_offset, 1),
-                        "end": round(seg["end"] + chunk_offset, 1),
-                        "text": seg["text"].strip(),
-                    })
-            except Exception as e:
-                print(f"[transcribe-podcast] chunk {chunk_name} failed: {e}")
-                status(stage=f"chunk {i+1} failed, continuing", chunksDone=i, chunksTotal=len(chunks),
-                       error=f"chunk {i+1}: {e}")
 
         if not all_segments:
             status(running=False, error="Transcription produced no segments")
@@ -926,7 +918,7 @@ def _run_transcribe_podcast(req: TranscribePodcastRequest):
             "segmentCount": len(all_segments),
             "transcribedAt": datetime.utcnow().isoformat(),
         })
-        status(running=False, stage="done", chunksDone=len(chunks), chunksTotal=len(chunks))
+        status(running=False, stage="done")
     except Exception as e:
         print(f"[transcribe-podcast] fatal: {e}")
         status(running=False, error=str(e)[:300])
@@ -940,8 +932,9 @@ def _run_transcribe_podcast(req: TranscribePodcastRequest):
 
 @app.post("/transcribe-podcast")
 def transcribe_podcast(req: TranscribePodcastRequest, background_tasks: BackgroundTasks):
-    """Kick off background transcription of a podcast episode (Hebrew, via Groq Whisper).
-    Frontend polls transcribeStatus/{episode_id}; result lands in podcastTranscripts/{episode_id}."""
+    """Kick off background transcription of a podcast episode (Hebrew + speaker diarization,
+    via Deepgram). Frontend polls transcribeStatus/{episode_id}; result lands in
+    podcastTranscripts/{episode_id}."""
     background_tasks.add_task(_run_transcribe_podcast, req)
     return {"started": True, "episode_id": req.episode_id}
 
@@ -957,22 +950,24 @@ one-liner, or an emotional/authentic beat — something that could stand alone a
 "Cut" means: filler words, rambling tangents, dead air, small talk unrelated to the topic, repeated points.
 "Keep" is everything solid but not standout — useful for a tighter full episode, not reel-worthy alone.
 
-Here is ONE WINDOW of the episode's timestamped transcript (seconds) — analyse ONLY this window closely
-and thoroughly, exactly like you would a short 7-10 minute clip. Do not worry about the rest of the
-episode; other windows are analysed separately.
+Here is ONE WINDOW of the episode's timestamped transcript (seconds) — each line is tagged with which
+speaker said it ("Speaker 1" / "Speaker 2" — these are just voice labels, not roles; the same person can
+be Speaker 1 in one episode and Speaker 2 in another). Analyse ONLY this window closely and thoroughly,
+exactly like you would a short 7-10 minute clip. Do not worry about the rest of the episode; other windows
+are analysed separately.
 
 {transcript}
 
 Return ONLY a JSON object with this exact shape:
 {{
   "gold": [
-    {{"start": <seconds>, "end": <seconds>, "why": "<one line in Hebrew or English>", "quote": "<the Hebrew quote>", "rank": <1 = best within this window>}}
+    {{"start": <seconds>, "end": <seconds>, "speaker": "<Speaker 1 or Speaker 2 — whoever is mainly talking in this moment>", "why": "<one line in Hebrew or English>", "quote": "<the Hebrew quote>", "rank": <1 = best within this window>}}
   ],
   "keep": [
-    {{"start": <seconds>, "end": <seconds>, "why": "<one line>", "quote": "<a short representative Hebrew quote from this segment>"}}
+    {{"start": <seconds>, "end": <seconds>, "speaker": "<Speaker 1 or Speaker 2>", "why": "<one line>", "quote": "<a short representative Hebrew quote from this segment>"}}
   ],
   "cut": [
-    {{"start": <seconds>, "end": <seconds>, "why": "<one line>", "quote": "<a short representative Hebrew quote from this segment>"}}
+    {{"start": <seconds>, "end": <seconds>, "speaker": "<Speaker 1 or Speaker 2>", "why": "<one line>", "quote": "<a short representative Hebrew quote from this segment>"}}
   ]
 }}
 
@@ -997,7 +992,7 @@ class TriagePodcastRequest(BaseModel):
 
 
 def _fmt_transcript_for_claude(segments: list) -> str:
-    lines = [f"[{s['start']}-{s['end']}] {s['text']}" for s in segments]
+    lines = [f"[{s['start']}-{s['end']}] ({s.get('speaker', 'Speaker 1')}) {s['text']}" for s in segments]
     return "\n".join(lines)
 
 
