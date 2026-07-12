@@ -820,7 +820,7 @@ def _deepgram_transcribe(audio_path: str) -> list:
     r = requests.post(
         "https://api.deepgram.com/v1/listen",
         params={
-            "language": "he", "diarize": "true", "punctuate": "true",
+            "model": "nova-3", "language": "he", "diarize": "true", "punctuate": "true",
             "utterances": "true", "smart_format": "true",
         },
         headers={"Authorization": f"Token {DEEPGRAM_API_KEY}", "Content-Type": "audio/mpeg"},
