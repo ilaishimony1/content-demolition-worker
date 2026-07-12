@@ -957,13 +957,16 @@ one-liner, or an emotional/authentic beat — something that could stand alone a
 "Cut" means: filler words, rambling tangents, dead air, small talk unrelated to the topic, repeated points.
 "Keep" is everything solid but not standout — useful for a tighter full episode, not reel-worthy alone.
 
-Here is the timestamped transcript (seconds):
+Here is ONE WINDOW of the episode's timestamped transcript (seconds) — analyse ONLY this window closely
+and thoroughly, exactly like you would a short 7-10 minute clip. Do not worry about the rest of the
+episode; other windows are analysed separately.
+
 {transcript}
 
 Return ONLY a JSON object with this exact shape:
 {{
   "gold": [
-    {{"start": <seconds>, "end": <seconds>, "why": "<one line in Hebrew or English>", "quote": "<the Hebrew quote>", "rank": <1 = best>}}
+    {{"start": <seconds>, "end": <seconds>, "why": "<one line in Hebrew or English>", "quote": "<the Hebrew quote>", "rank": <1 = best within this window>}}
   ],
   "keep": [
     {{"start": <seconds>, "end": <seconds>, "why": "<one line>", "quote": "<a short representative Hebrew quote from this segment>"}}
@@ -973,19 +976,18 @@ Return ONLY a JSON object with this exact shape:
   ]
 }}
 
-CRITICAL — scan the ENTIRE episode from the first timestamp to the very last one. Find EVERY gold moment
-across the whole runtime, not just the beginning. A long episode (60+ min) can have 15-30 gold moments
-spread throughout — do not stop early or focus only on the opening.
+CRITICAL — read this window CLOSELY, line by line. Do not skim. Find EVERY gold moment in this window,
+even a short one — a punchy one-liner is gold even if it's only 15 seconds. Do not just grab one "best"
+moment per window and move on; a rich window can have 2-4 gold moments.
 
 For GOLD: each is a self-contained "nugget" — starts on the hook (the punchy line), ends where that
 specific idea/story pays off. Bias tight; most are 20-90 seconds; only a full pure-gold story goes up to
-~150 seconds max. Do NOT extend a clip to a whole subject — a 10-minute topic yields one tight nugget, not
-10 minutes. Rank gold best-first.
+~150 seconds max. Do NOT extend a clip to a whole subject. Rank gold best-first WITHIN this window.
 
 For KEEP: solid supporting context, a representative sample (doesn't need to be exhaustive).
 
-For CUT: give only 5-10 REPRESENTATIVE examples of filler/rambling/tangents — do NOT try to list every
-non-gold second of the episode. The rest of the runtime is implicitly cut; we only care that gold is complete.
+For CUT: give only 2-5 REPRESENTATIVE examples of filler/rambling/silence in this window — do NOT try to
+list every non-gold second. The rest of this window is implicitly cut.
 
 Merge adjacent segments that belong to the same moment into one range."""
 
@@ -999,34 +1001,107 @@ def _fmt_transcript_for_claude(segments: list) -> str:
     return "\n".join(lines)
 
 
-@app.post("/triage-podcast")
-def triage_podcast(req: TriagePodcastRequest):
-    """Read the saved transcript and ask Claude to produce the gold/keep/cut triage map.
-    Synchronous (transcript analysis is a single fast call) — saves to podcastTriage/{episode_id}."""
-    doc = firestore_get(f"podcastTranscripts/{req.episode_id}")
+def _chunk_segments(segments: list, window_seconds: float = 600, overlap_seconds: float = 30) -> list:
+    """Split segments into ~10-min windows (with a little overlap so a moment spanning
+    a window boundary isn't missed) for focused, per-window triage."""
+    if not segments:
+        return []
+    total_end = segments[-1]["end"]
+    windows = []
+    start = 0.0
+    while start < total_end:
+        end = start + window_seconds
+        windows.append([s for s in segments if s["end"] > start and s["start"] < end])
+        start = end - overlap_seconds
+    return [w for w in windows if w]
+
+
+def _triage_one_window(segments: list) -> dict:
+    transcript_text = _fmt_transcript_for_claude(segments)
+    msg = claude.messages.create(
+        model="claude-sonnet-4-6",
+        max_tokens=4000,
+        messages=[{"role": "user", "content": TRIAGE_PROMPT.format(transcript=transcript_text)}],
+    )
+    raw = msg.content[0].text if msg.content and msg.content[0].type == "text" else "{}"
+    m = re.search(r"\{[\s\S]*\}", raw)
+    return json.loads(m.group(0)) if m else {"gold": [], "keep": [], "cut": []}
+
+
+def _dedupe_by_overlap(items: list) -> list:
+    """Windows overlap by 30s, so the same moment can be caught twice. Drop items whose
+    [start,end] range overlaps a previously-kept item's range by more than half."""
+    kept = []
+    for item in sorted(items, key=lambda x: x["start"]):
+        dup = False
+        for k in kept:
+            overlap = min(item["end"], k["end"]) - max(item["start"], k["start"])
+            shorter = min(item["end"] - item["start"], k["end"] - k["start"])
+            if shorter > 0 and overlap / shorter > 0.5:
+                dup = True
+                break
+        if not dup:
+            kept.append(item)
+    return kept
+
+
+def _run_triage_podcast(episode_id: str):
+    """Chunk the transcript into ~10-min windows, triage each window closely (same focused
+    approach that works well on a short clip), merge + dedupe + re-rank gold. Runs in
+    background; frontend polls triageStatus/{episode_id}."""
+
+    def status(**extra):
+        firestore_patch(f"triageStatus/{episode_id}", {
+            "running": extra.get("running", True),
+            "windowsDone": extra.get("windowsDone", 0),
+            "windowsTotal": extra.get("windowsTotal", 0),
+            "error": extra.get("error", ""),
+            "updatedAt": datetime.utcnow().isoformat(),
+        })
+
+    status(stage="starting")
+    doc = firestore_get(f"podcastTranscripts/{episode_id}")
     data = parse_fs_doc(doc)
     if not data or "segments" not in data:
-        raise HTTPException(status_code=404, detail="No transcript found for this episode_id")
+        status(running=False, error="No transcript found for this episode_id")
+        return
 
     segments = json.loads(data["segments"])
-    transcript_text = _fmt_transcript_for_claude(segments)
+    windows = _chunk_segments(segments)
+    total = len(windows)
+    status(windowsTotal=total)
 
-    try:
-        msg = claude.messages.create(
-            model="claude-sonnet-4-6",
-            max_tokens=8000,
-            messages=[{"role": "user", "content": TRIAGE_PROMPT.format(transcript=transcript_text)}],
-        )
-        raw = msg.content[0].text if msg.content and msg.content[0].type == "text" else "{}"
-        m = re.search(r"\{[\s\S]*\}", raw)
-        triage = json.loads(m.group(0)) if m else {"gold": [], "keep": [], "cut": []}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Triage failed: {e}")
+    all_gold, all_keep, all_cut = [], [], []
+    for i, window in enumerate(windows):
+        status(windowsDone=i, windowsTotal=total)
+        try:
+            result = _triage_one_window(window)
+            all_gold.extend(result.get("gold", []))
+            all_keep.extend(result.get("keep", []))
+            all_cut.extend(result.get("cut", []))
+        except Exception as e:
+            print(f"[triage-podcast] window {i+1}/{total} failed: {e}")
 
-    firestore_patch(f"podcastTriage/{req.episode_id}", {
-        "gold": json.dumps(triage.get("gold", []), ensure_ascii=False),
-        "keep": json.dumps(triage.get("keep", []), ensure_ascii=False),
-        "cut": json.dumps(triage.get("cut", []), ensure_ascii=False),
+    gold = _dedupe_by_overlap(all_gold)
+    keep = _dedupe_by_overlap(all_keep)
+    cut = _dedupe_by_overlap(all_cut)
+    # Re-rank gold globally, best-first, now that all windows are merged.
+    gold.sort(key=lambda x: x.get("rank", 99))
+    for idx, g in enumerate(gold):
+        g["rank"] = idx + 1
+
+    firestore_patch(f"podcastTriage/{episode_id}", {
+        "gold": json.dumps(gold, ensure_ascii=False),
+        "keep": json.dumps(keep, ensure_ascii=False),
+        "cut": json.dumps(cut, ensure_ascii=False),
         "triagedAt": datetime.utcnow().isoformat(),
     })
-    return {"success": True, "episode_id": req.episode_id, "triage": triage}
+    status(running=False, windowsDone=total, windowsTotal=total)
+
+
+@app.post("/triage-podcast")
+def triage_podcast(req: TriagePodcastRequest, background_tasks: BackgroundTasks):
+    """Kick off background chunked triage (one focused pass per ~10-min window, merged).
+    Frontend polls triageStatus/{episode_id}; result lands in podcastTriage/{episode_id}."""
+    background_tasks.add_task(_run_triage_podcast, req.episode_id)
+    return {"started": True, "episode_id": req.episode_id}
