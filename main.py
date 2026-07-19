@@ -582,15 +582,11 @@ def push_to_drive(req: PushRequest, background_tasks: BackgroundTasks):
     return {"started": True, "to_move": len(req.moves)}
 
 
-@app.post("/refresh-ig-tokens")
-def refresh_ig_tokens(x_worker_secret: str = Header(default="")):
-    """Keep every connected Instagram account ALIVE so clients connect ONCE and never
-    have to reconnect. Instagram long-lived tokens last 60 days but can be refreshed for
-    another 60 while still valid — run this on a weekly cron. Also re-fetches the profile
-    photo + follower count (those URLs go stale faster than the token). Idempotent + safe."""
-    if x_worker_secret != WORKER_SECRET:
-        raise HTTPException(status_code=401, detail="unauthorized")
-
+def _refresh_ig_tokens_core():
+    """Keep every connected Instagram account ALIVE so clients connect ONCE and never have
+    to reconnect. IG long-lived tokens last 60 days but can be refreshed for another 60 while
+    still valid. Also re-fetches the profile photo + follower count (those go stale faster
+    than the token). Idempotent + safe to run repeatedly."""
     url = f"https://firestore.googleapis.com/v1/projects/{FIREBASE_PROJECT_ID}/databases/(default)/documents:runQuery"
     body = {"structuredQuery": {"from": [{"collectionId": "users"}], "where": {"fieldFilter": {
         "field": {"fieldPath": "instagramConnected"}, "op": "EQUAL", "value": {"booleanValue": True}}}}}
@@ -642,6 +638,34 @@ def refresh_ig_tokens(x_worker_secret: str = Header(default="")):
             results.append({"username": username, "ok": False, "error": str(e)[:150]})
 
     return {"refreshed": refreshed, "failed": failed, "results": results}
+
+
+@app.post("/refresh-ig-tokens")
+def refresh_ig_tokens(x_worker_secret: str = Header(default="")):
+    """Manual trigger for the IG token refresh (also runs automatically every ~3 days)."""
+    if x_worker_secret != WORKER_SECRET:
+        raise HTTPException(status_code=401, detail="unauthorized")
+    return _refresh_ig_tokens_core()
+
+
+def _ig_token_refresh_loop():
+    """Self-contained scheduler: refresh all connected IG tokens every ~3 days so clients
+    never have to reconnect. Runs in a daemon thread — no external cron needed."""
+    import time
+    time.sleep(60)  # let the app finish booting
+    while True:
+        try:
+            summary = _refresh_ig_tokens_core()
+            print(f"[ig-refresh] {summary.get('refreshed')} refreshed, {summary.get('failed')} failed")
+        except Exception as e:
+            print(f"[ig-refresh] loop error: {e}")
+        time.sleep(3 * 24 * 3600)  # every 3 days (well inside the 60-day expiry window)
+
+
+@app.on_event("startup")
+def _start_ig_refresh():
+    import threading
+    threading.Thread(target=_ig_token_refresh_loop, daemon=True).start()
 
 
 class BuildReelClip(BaseModel):
