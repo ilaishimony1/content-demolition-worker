@@ -6,7 +6,7 @@ import subprocess
 import tempfile
 import requests
 import anthropic
-from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi import FastAPI, HTTPException, BackgroundTasks, Header
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional
@@ -580,6 +580,68 @@ def push_to_drive(req: PushRequest, background_tasks: BackgroundTasks):
     Runs in background; frontend polls pushStatus/{client_id}."""
     background_tasks.add_task(_run_push, req)
     return {"started": True, "to_move": len(req.moves)}
+
+
+@app.post("/refresh-ig-tokens")
+def refresh_ig_tokens(x_worker_secret: str = Header(default="")):
+    """Keep every connected Instagram account ALIVE so clients connect ONCE and never
+    have to reconnect. Instagram long-lived tokens last 60 days but can be refreshed for
+    another 60 while still valid — run this on a weekly cron. Also re-fetches the profile
+    photo + follower count (those URLs go stale faster than the token). Idempotent + safe."""
+    if x_worker_secret != WORKER_SECRET:
+        raise HTTPException(status_code=401, detail="unauthorized")
+
+    url = f"https://firestore.googleapis.com/v1/projects/{FIREBASE_PROJECT_ID}/databases/(default)/documents:runQuery"
+    body = {"structuredQuery": {"from": [{"collectionId": "users"}], "where": {"fieldFilter": {
+        "field": {"fieldPath": "instagramConnected"}, "op": "EQUAL", "value": {"booleanValue": True}}}}}
+    rows = requests.post(url, json=body).json()
+
+    refreshed, failed, results = 0, 0, []
+    for row in rows:
+        doc = row.get("document")
+        if not doc:
+            continue
+        data = parse_fs_doc(doc)
+        doc_id = doc["name"].split("/")[-1]
+        token = data.get("instagramAccessToken")
+        username = data.get("instagramUsername", "?")
+        if not token:
+            continue
+        try:
+            rr = requests.get("https://graph.instagram.com/refresh_access_token",
+                              params={"grant_type": "ig_refresh_token", "access_token": token}, timeout=30)
+            rj = rr.json()
+            new_token = rj.get("access_token")
+            if not new_token:
+                # Token likely already expired → account needs a manual reconnect
+                firestore_patch(f"users/{doc_id}", {"instagramTokenError": str(rj)[:250]})
+                failed += 1
+                results.append({"username": username, "ok": False, "error": str(rj)[:150]})
+                continue
+            fields = {"instagramAccessToken": new_token,
+                      "instagramConnectedAt": datetime.utcnow().isoformat() + "Z",
+                      "instagramTokenError": ""}
+            # Refresh display fields so the photo/followers don't go stale
+            try:
+                pr = requests.get("https://graph.instagram.com/v19.0/me",
+                                  params={"fields": "username,followers_count,profile_picture_url",
+                                          "access_token": new_token}, timeout=30).json()
+                if pr.get("username"):
+                    fields["instagramUsername"] = pr["username"]
+                if pr.get("profile_picture_url"):
+                    fields["instagramProfilePicture"] = pr["profile_picture_url"]
+                if pr.get("followers_count") is not None:
+                    fields["instagramFollowers"] = int(pr["followers_count"])
+            except Exception:
+                pass
+            firestore_patch(f"users/{doc_id}", fields)
+            refreshed += 1
+            results.append({"username": username, "ok": True})
+        except Exception as e:
+            failed += 1
+            results.append({"username": username, "ok": False, "error": str(e)[:150]})
+
+    return {"refreshed": refreshed, "failed": failed, "results": results}
 
 
 class BuildReelClip(BaseModel):
