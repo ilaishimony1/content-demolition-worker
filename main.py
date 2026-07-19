@@ -622,12 +622,14 @@ def _refresh_ig_tokens_core():
                 pr = requests.get("https://graph.instagram.com/v19.0/me",
                                   params={"fields": "username,followers_count,profile_picture_url",
                                           "access_token": new_token}, timeout=30).json()
+                # NB: field names must match what the connect callback + UI use:
+                # `profilePhoto` (raw URL) and `followers` (formatted "3.0K").
                 if pr.get("username"):
                     fields["instagramUsername"] = pr["username"]
                 if pr.get("profile_picture_url"):
-                    fields["instagramProfilePicture"] = pr["profile_picture_url"]
+                    fields["profilePhoto"] = pr["profile_picture_url"]
                 if pr.get("followers_count") is not None:
-                    fields["instagramFollowers"] = int(pr["followers_count"])
+                    fields["followers"] = f"{pr['followers_count'] / 1000:.1f}K"
             except Exception:
                 pass
             firestore_patch(f"users/{doc_id}", fields)
