@@ -2,12 +2,15 @@ import os
 import re
 import json
 import base64
+import secrets
 import subprocess
 import tempfile
+import time
 import requests
 import anthropic
 from fastapi import FastAPI, HTTPException, BackgroundTasks, Header
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from typing import Optional
 from datetime import datetime
@@ -668,6 +671,105 @@ def _ig_token_refresh_loop():
 def _start_ig_refresh():
     import threading
     threading.Thread(target=_ig_token_refresh_loop, daemon=True).start()
+
+
+# ---------------------------------------------------------------------------
+# Reel auto-poster: publish a Drive reel to Instagram.
+# Instagram's API needs the video at a PUBLIC url, so the worker downloads the
+# reel from Drive and serves it at /reel-media/{id} just long enough for Meta
+# to fetch it, then creates the media container and publishes it.
+# ---------------------------------------------------------------------------
+_SERVED_FILES: dict = {}  # media_id -> local filepath (public for Meta to fetch)
+
+
+@app.get("/reel-media/{media_id}")
+def serve_reel_media(media_id: str):
+    path = _SERVED_FILES.get(media_id)
+    if not path or not os.path.exists(path):
+        raise HTTPException(status_code=404, detail="not found")
+    return FileResponse(path, media_type="video/mp4")
+
+
+class PublishReelRequest(BaseModel):
+    post_id: Optional[str] = None          # Firestore scheduledPosts doc id (status updates)
+    drive_file_id: str
+    google_access_token: str               # to download the reel from Drive
+    ig_access_token: str                   # the client's Instagram token
+    worker_public_url: str                 # this worker's public base url (so Meta can fetch)
+    caption: Optional[str] = ""
+
+
+def _run_publish(req: PublishReelRequest):
+    def status(**kw):
+        if req.post_id:
+            firestore_patch(f"scheduledPosts/{req.post_id}",
+                            {"updatedAt": datetime.utcnow().isoformat() + "Z", **kw})
+
+    media_id = secrets.token_urlsafe(16)
+    tmp_path = os.path.join(tempfile.gettempdir(), f"reel_{media_id}.mp4")
+    try:
+        status(status="posting", error="")
+        # 1. Download the reel from Drive
+        with requests.get(f"https://www.googleapis.com/drive/v3/files/{req.drive_file_id}?alt=media",
+                          headers={"Authorization": f"Bearer {req.google_access_token}"},
+                          stream=True, timeout=600) as r:
+            if r.status_code != 200:
+                raise RuntimeError(f"drive download failed {r.status_code}: {r.text[:150]}")
+            with open(tmp_path, "wb") as f:
+                for chunk in r.iter_content(1024 * 1024):
+                    f.write(chunk)
+        _SERVED_FILES[media_id] = tmp_path
+        public_url = f"{req.worker_public_url.rstrip('/')}/reel-media/{media_id}"
+
+        # 2. Create the reel media container
+        c = requests.post("https://graph.instagram.com/v19.0/me/media",
+                          params={"media_type": "REELS", "video_url": public_url,
+                                  "caption": req.caption or "", "access_token": req.ig_access_token},
+                          timeout=60).json()
+        creation_id = c.get("id")
+        if not creation_id:
+            raise RuntimeError(f"container failed: {c}")
+
+        # 3. Wait for Instagram to fetch + process the video
+        for _ in range(60):  # up to ~5 min
+            s = requests.get(f"https://graph.instagram.com/v19.0/{creation_id}",
+                             params={"fields": "status_code,status", "access_token": req.ig_access_token},
+                             timeout=30).json()
+            code = s.get("status_code")
+            if code == "FINISHED":
+                break
+            if code == "ERROR":
+                raise RuntimeError(f"IG processing error: {s}")
+            time.sleep(5)
+        else:
+            raise RuntimeError("timed out waiting for Instagram to process the reel")
+
+        # 4. Publish
+        p = requests.post("https://graph.instagram.com/v19.0/me/media_publish",
+                          params={"creation_id": creation_id, "access_token": req.ig_access_token},
+                          timeout=60).json()
+        published_id = p.get("id")
+        if not published_id:
+            raise RuntimeError(f"publish failed: {p}")
+        status(status="posted", igMediaId=str(published_id),
+               postedAt=datetime.utcnow().isoformat() + "Z", error="")
+    except Exception as e:
+        status(status="failed", error=str(e)[:300])
+        print(f"[publish-reel] error: {e}")
+    finally:
+        _SERVED_FILES.pop(media_id, None)
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+
+
+@app.post("/publish-reel")
+def publish_reel(req: PublishReelRequest, background_tasks: BackgroundTasks, x_worker_secret: str = Header(default="")):
+    if x_worker_secret != WORKER_SECRET:
+        raise HTTPException(status_code=401, detail="unauthorized")
+    background_tasks.add_task(_run_publish, req)
+    return {"started": True}
 
 
 class BuildReelClip(BaseModel):
