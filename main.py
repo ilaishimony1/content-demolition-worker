@@ -629,11 +629,13 @@ _IG_TRANSIENT_CODES = {1, 2, 4, 17, 32, 341, 368, 613} | set(range(80001, 80008)
 
 
 def _is_ig_auth_error(payload: dict) -> bool:
-    """False only for failures that resolve on their own. Flagging a rate limit or a Meta
-    5xx as 'reconnect me' takes an account offline for days over a hiccup."""
+    """True only when Meta returned a structured error that won't resolve on its own. A real
+    dead credential always arrives with an error code; a shapeless or garbled body is a proxy
+    or gateway artifact, so treating it as a verdict on the credential would take the account
+    offline until the next pass 3 days later."""
     err = (payload or {}).get("error")
     if not isinstance(err, dict):
-        return True
+        return False
     return err.get("code") not in _IG_TRANSIENT_CODES
 
 
