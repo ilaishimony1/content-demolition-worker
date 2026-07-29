@@ -13,7 +13,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from typing import Optional
-from datetime import datetime
+from datetime import datetime, timedelta
 
 app = FastAPI(title="Content Demolition Worker")
 
@@ -27,6 +27,18 @@ app.add_middleware(
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 FIREBASE_PROJECT_ID = os.environ.get("FIREBASE_PROJECT_ID", "")
 WORKER_SECRET = os.environ.get("WORKER_SECRET", "demolition-secret")
+
+# Needed by the scheduler clock, which runs with no browser session attached:
+# it mints its own Google access token from the refresh token saved at sign-in.
+GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID", "")
+GOOGLE_CLIENT_SECRET = os.environ.get("GOOGLE_CLIENT_SECRET", "")
+# This worker's own public URL — Instagram fetches the video from it.
+WORKER_PUBLIC_URL = os.environ.get("WORKER_PUBLIC_URL", "")
+TIKTOK_CLIENT_KEY = os.environ.get("TIKTOK_CLIENT_KEY", "")
+TIKTOK_CLIENT_SECRET = os.environ.get("TIKTOK_CLIENT_SECRET", "")
+# Set SCHEDULER_ENABLED=0 to stop the clock firing (e.g. on a staging copy that
+# shares the same Firestore — otherwise both copies would post the same video).
+SCHEDULER_ENABLED = os.environ.get("SCHEDULER_ENABLED", "1") not in ("0", "false", "False")
 
 claude = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
@@ -43,23 +55,28 @@ def firestore_query(collection: str, field: str, value: str):
     r = requests.post(url, json=body)
     return r.json()
 
+def _fs_value(v):
+    """Encode one Python value as a Firestore REST value, recursively.
+
+    Nested maps/arrays matter for the scheduler: a post's per-platform `results`
+    is a map of maps, and flattening it to strings would lose the structure the
+    UI reads back."""
+    if v is None:
+        return {"nullValue": None}
+    if isinstance(v, bool):
+        return {"booleanValue": v}
+    if isinstance(v, (int, float)):
+        return {"doubleValue": float(v)}
+    if isinstance(v, list):
+        return {"arrayValue": {"values": [_fs_value(item) for item in v]}}
+    if isinstance(v, dict):
+        return {"mapValue": {"fields": {kk: _fs_value(vv) for kk, vv in v.items()}}}
+    return {"stringValue": str(v)}
+
 def firestore_patch(path: str, fields: dict):
     url_fields = "&".join([f"updateMask.fieldPaths={k}" for k in fields])
     url = f"https://firestore.googleapis.com/v1/projects/{FIREBASE_PROJECT_ID}/databases/(default)/documents/{path}?{url_fields}"
-    fs_fields = {}
-    for k, v in fields.items():
-        if v is None:
-            fs_fields[k] = {"nullValue": None}
-        elif isinstance(v, bool):
-            fs_fields[k] = {"booleanValue": v}
-        elif isinstance(v, int) or isinstance(v, float):
-            fs_fields[k] = {"doubleValue": float(v)}
-        elif isinstance(v, list):
-            fs_fields[k] = {"arrayValue": {"values": [{"stringValue": str(item)} for item in v]}}
-        elif isinstance(v, dict):
-            fs_fields[k] = {"mapValue": {"fields": {kk: {"stringValue": str(vv)} for kk, vv in v.items()}}}
-        else:
-            fs_fields[k] = {"stringValue": str(v)}
+    fs_fields = {k: _fs_value(v) for k, v in fields.items()}
     r = requests.patch(url, json={"fields": fs_fields})
     return r.json()
 
@@ -78,6 +95,22 @@ def firestore_create(collection: str, doc_id: str, fields: dict):
     r = requests.patch(url, json={"fields": fs_fields})
     return r.json()
 
+def _parse_fs_value(v: dict):
+    """Decode one Firestore REST value back to Python (mirror of _fs_value)."""
+    if "stringValue" in v:
+        return v["stringValue"]
+    if "booleanValue" in v:
+        return v["booleanValue"]
+    if "integerValue" in v:
+        return int(v["integerValue"])
+    if "doubleValue" in v:
+        return float(v["doubleValue"])
+    if "arrayValue" in v:
+        return [_parse_fs_value(item) for item in v["arrayValue"].get("values", [])]
+    if "mapValue" in v:
+        return {kk: _parse_fs_value(vv) for kk, vv in v["mapValue"].get("fields", {}).items()}
+    return None
+
 def parse_fs_doc(doc: dict) -> dict:
     result = {}
     if not doc or "fields" not in doc:
@@ -91,6 +124,10 @@ def parse_fs_doc(doc: dict) -> dict:
             result[k] = int(v["integerValue"])
         elif "doubleValue" in v:
             result[k] = float(v["doubleValue"])
+        elif "arrayValue" in v:
+            result[k] = [_parse_fs_value(item) for item in v["arrayValue"].get("values", [])]
+        elif "mapValue" in v:
+            result[k] = {kk: _parse_fs_value(vv) for kk, vv in v["mapValue"].get("fields", {}).items()}
         elif "nullValue" in v:
             result[k] = None
     return result
@@ -693,47 +730,131 @@ def serve_reel_media(media_id: str):
 class PublishReelRequest(BaseModel):
     post_id: Optional[str] = None          # Firestore scheduledPosts doc id (status updates)
     drive_file_id: str
-    google_access_token: str               # to download the reel from Drive
-    ig_access_token: str                   # the client's Instagram token
-    worker_public_url: str                 # this worker's public base url (so Meta can fetch)
+    # Optional because the scheduler clock has no browser session to borrow tokens from —
+    # it looks up / mints every credential itself from what's stored in Firestore.
+    google_access_token: Optional[str] = None   # to download the video from Drive
+    ig_access_token: Optional[str] = None       # the client's Instagram token
+    worker_public_url: Optional[str] = None     # this worker's public base url (so Meta can fetch)
     caption: Optional[str] = ""
+    client_id: Optional[str] = None             # which connected account to post as
+    platforms: list[str] = ["instagram"]
+    youtube_title: Optional[str] = None
+    youtube_privacy: str = "private"
+    tiktok_privacy: str = "SELF_ONLY"
 
 
-def _run_publish(req: PublishReelRequest):
-    def status(**kw):
-        if req.post_id:
-            firestore_patch(f"scheduledPosts/{req.post_id}",
-                            {"updatedAt": datetime.utcnow().isoformat() + "Z", **kw})
+# ─── Credentials the clock fetches for itself ────────────────────────────────
 
-    media_id = secrets.token_urlsafe(16)
-    tmp_path = os.path.join(tempfile.gettempdir(), f"reel_{media_id}.mp4")
+def _google_access_token() -> str:
+    """Mint a fresh Google access token from the refresh token saved at sign-in.
+
+    The web app stores it at integrations/google when Ilai signs in with Google.
+    Without this the scheduler could only ever run while a browser tab was open."""
+    if not (GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET):
+        raise RuntimeError("worker is missing GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET")
+    doc = firestore_get("integrations/google")
+    data = parse_fs_doc(doc)
+    refresh = data.get("refreshToken")
+    if not refresh:
+        raise RuntimeError("no saved Google login — open the app and sign in with Google once")
+    r = requests.post("https://oauth2.googleapis.com/token", data={
+        "client_id": GOOGLE_CLIENT_ID,
+        "client_secret": GOOGLE_CLIENT_SECRET,
+        "grant_type": "refresh_token",
+        "refresh_token": refresh,
+    }, timeout=30)
+    j = r.json()
+    token = j.get("access_token")
+    if not token:
+        firestore_patch("integrations/google", {"error": str(j)[:250]})
+        raise RuntimeError(f"Google token refresh failed: {str(j)[:150]}")
+    return token
+
+
+def _client_doc(client_id: str):
+    """Find a connected account's Firestore doc by its clientId slug."""
+    rows = firestore_query("users", "clientId", client_id)
+    for row in rows if isinstance(rows, list) else []:
+        doc = row.get("document")
+        if doc:
+            return doc["name"].split("/")[-1], parse_fs_doc(doc)
+    return None, {}
+
+
+def _tiktok_access_token(doc_id: str, data: dict) -> tuple:
+    """Return (access_token, granted_scope), refreshing first if it's close to expiry.
+
+    TikTok access tokens only last 24h, so a video scheduled for tomorrow will almost
+    always need this refresh before it can post."""
+    token = data.get("tiktokAccessToken")
+    refresh = data.get("tiktokRefreshToken")
+    scope = data.get("tiktokScope") or ""
+    expires_at = data.get("tiktokTokenExpiresAt") or ""
+
+    still_fresh = False
+    if token and expires_at:
+        try:
+            exp = datetime.fromisoformat(expires_at.replace("Z", "+00:00")).timestamp()
+            still_fresh = exp - time.time() > 600  # 10 min safety margin
+        except ValueError:
+            still_fresh = False
+    if still_fresh:
+        return token, scope
+
+    if not refresh:
+        raise RuntimeError("TikTok isn't connected for this account — connect it first")
+    if not (TIKTOK_CLIENT_KEY and TIKTOK_CLIENT_SECRET):
+        raise RuntimeError("worker is missing TIKTOK_CLIENT_KEY / TIKTOK_CLIENT_SECRET")
+
+    r = requests.post("https://open.tiktokapis.com/v2/oauth/token/",
+                      headers={"Content-Type": "application/x-www-form-urlencoded"},
+                      data={"client_key": TIKTOK_CLIENT_KEY,
+                            "client_secret": TIKTOK_CLIENT_SECRET,
+                            "grant_type": "refresh_token",
+                            "refresh_token": refresh}, timeout=30)
+    j = r.json()
+    new_token = j.get("access_token")
+    if not new_token:
+        firestore_patch(f"users/{doc_id}", {"tiktokTokenError": str(j)[:250]})
+        raise RuntimeError(f"TikTok token refresh failed: {str(j)[:150]}")
+    scope = j.get("scope") or scope
+    firestore_patch(f"users/{doc_id}", {
+        "tiktokAccessToken": new_token,
+        "tiktokRefreshToken": j.get("refresh_token") or refresh,
+        "tiktokScope": scope,
+        "tiktokTokenExpiresAt": datetime.utcfromtimestamp(
+            time.time() + (j.get("expires_in") or 86400)).isoformat() + "Z",
+        "tiktokTokenError": "",
+    })
+    return new_token, scope
+
+
+# ─── Per-platform publishers ─────────────────────────────────────────────────
+# Each returns a dict shaped like the UI's PlatformResult, and raises on failure.
+
+def _publish_instagram(tmp_path: str, media_id: str, caption: str,
+                       ig_token: str, public_base: str) -> dict:
+    """Instagram pulls the file from a public URL, so serve it while Meta fetches."""
+    if not ig_token:
+        raise RuntimeError("this account has no connected Instagram")
+    if not public_base:
+        raise RuntimeError("worker has no public URL configured (WORKER_PUBLIC_URL)")
+
+    _SERVED_FILES[media_id] = tmp_path
     try:
-        status(status="posting", error="")
-        # 1. Download the reel from Drive
-        with requests.get(f"https://www.googleapis.com/drive/v3/files/{req.drive_file_id}?alt=media",
-                          headers={"Authorization": f"Bearer {req.google_access_token}"},
-                          stream=True, timeout=600) as r:
-            if r.status_code != 200:
-                raise RuntimeError(f"drive download failed {r.status_code}: {r.text[:150]}")
-            with open(tmp_path, "wb") as f:
-                for chunk in r.iter_content(1024 * 1024):
-                    f.write(chunk)
-        _SERVED_FILES[media_id] = tmp_path
-        public_url = f"{req.worker_public_url.rstrip('/')}/reel-media/{media_id}"
-
-        # 2. Create the reel media container
+        public_url = f"{public_base.rstrip('/')}/reel-media/{media_id}"
         c = requests.post("https://graph.instagram.com/v19.0/me/media",
                           params={"media_type": "REELS", "video_url": public_url,
-                                  "caption": req.caption or "", "access_token": req.ig_access_token},
+                                  "caption": caption or "", "access_token": ig_token},
                           timeout=60).json()
         creation_id = c.get("id")
         if not creation_id:
             raise RuntimeError(f"container failed: {c}")
 
-        # 3. Wait for Instagram to fetch + process the video
+        # Wait for Instagram to fetch + process the video
         for _ in range(60):  # up to ~5 min
             s = requests.get(f"https://graph.instagram.com/v19.0/{creation_id}",
-                             params={"fields": "status_code,status", "access_token": req.ig_access_token},
+                             params={"fields": "status_code,status", "access_token": ig_token},
                              timeout=30).json()
             code = s.get("status_code")
             if code == "FINISHED":
@@ -744,17 +865,223 @@ def _run_publish(req: PublishReelRequest):
         else:
             raise RuntimeError("timed out waiting for Instagram to process the reel")
 
-        # 4. Publish
         p = requests.post("https://graph.instagram.com/v19.0/me/media_publish",
-                          params={"creation_id": creation_id, "access_token": req.ig_access_token},
+                          params={"creation_id": creation_id, "access_token": ig_token},
                           timeout=60).json()
         published_id = p.get("id")
         if not published_id:
             raise RuntimeError(f"publish failed: {p}")
-        status(status="posted", igMediaId=str(published_id),
-               postedAt=datetime.utcnow().isoformat() + "Z", error="")
+        return {"status": "posted", "postId": str(published_id),
+                "postedAt": datetime.utcnow().isoformat() + "Z"}
+    finally:
+        _SERVED_FILES.pop(media_id, None)
+
+
+def _youtube_title_from(caption: str, fallback: str) -> str:
+    """YouTube shows a title; IG/TikTok don't. Take the caption's first real line."""
+    for line in (caption or "").splitlines():
+        cleaned = re.sub(r"#\S+", "", line).strip()
+        if cleaned:
+            return cleaned[:100]
+    return (fallback or "Untitled")[:100]
+
+
+def _publish_youtube(tmp_path: str, title: str, description: str,
+                     privacy: str, google_token: str) -> dict:
+    """Resumable upload to YouTube.
+
+    NOTE: until this Google Cloud project passes YouTube's API audit, every upload is
+    locked to private by YouTube and CANNOT be made public afterwards — the video has to
+    be re-uploaded. That's why the app defaults privacy to 'private' and says so loudly."""
+    size = os.path.getsize(tmp_path)
+    metadata = {
+        "snippet": {"title": title, "description": description or "", "categoryId": "22"},
+        "status": {"privacyStatus": privacy or "private", "selfDeclaredMadeForKids": False},
+    }
+    start = requests.post(
+        "https://www.googleapis.com/upload/youtube/v3/videos",
+        params={"uploadType": "resumable", "part": "snippet,status"},
+        headers={"Authorization": f"Bearer {google_token}",
+                 "Content-Type": "application/json; charset=UTF-8",
+                 "X-Upload-Content-Length": str(size),
+                 "X-Upload-Content-Type": "video/mp4"},
+        json=metadata, timeout=60)
+    if start.status_code not in (200, 201):
+        raise RuntimeError(f"youtube init failed {start.status_code}: {start.text[:200]}")
+    upload_url = start.headers.get("Location")
+    if not upload_url:
+        raise RuntimeError("youtube did not return an upload url")
+
+    with open(tmp_path, "rb") as f:
+        up = requests.put(upload_url, data=f,
+                          headers={"Content-Type": "video/mp4", "Content-Length": str(size)},
+                          timeout=1800)
+    if up.status_code not in (200, 201):
+        raise RuntimeError(f"youtube upload failed {up.status_code}: {up.text[:200]}")
+    video_id = (up.json() or {}).get("id")
+    if not video_id:
+        raise RuntimeError(f"youtube upload returned no id: {up.text[:200]}")
+    return {"status": "posted", "postId": video_id,
+            "url": f"https://youtube.com/watch?v={video_id}",
+            "postedAt": datetime.utcnow().isoformat() + "Z"}
+
+
+def _publish_tiktok(tmp_path: str, caption: str, privacy: str,
+                    tiktok_token: str, scope: str) -> dict:
+    """Upload to TikTok.
+
+    Two routes, picked by what TikTok has actually granted this app:
+      - video.publish (granted only after TikTok's audit) → posts straight to the profile.
+      - video.upload  → drops it into the creator's TikTok inbox as a draft to tap publish on.
+    Unaudited apps are forced to private viewing regardless, so the draft route is the
+    honest default until the audit clears."""
+    size = os.path.getsize(tmp_path)
+    can_direct_post = "video.publish" in (scope or "")
+
+    # TikTok wants chunks of 5MB-64MB; the final chunk carries any remainder.
+    if size <= 64 * 1024 * 1024:
+        chunk_size, total_chunks = size, 1
+    else:
+        chunk_size = 10 * 1024 * 1024
+        total_chunks = size // chunk_size
+
+    headers = {"Authorization": f"Bearer {tiktok_token}",
+               "Content-Type": "application/json; charset=UTF-8"}
+    source_info = {"source": "FILE_UPLOAD", "video_size": size,
+                   "chunk_size": chunk_size, "total_chunk_count": total_chunks}
+
+    if can_direct_post:
+        init_url = "https://open.tiktokapis.com/v2/post/publish/video/init/"
+        body = {"post_info": {"title": (caption or "")[:2200],
+                              "privacy_level": privacy or "SELF_ONLY",
+                              "disable_duet": False, "disable_stitch": False,
+                              "disable_comment": False},
+                "source_info": source_info}
+    else:
+        init_url = "https://open.tiktokapis.com/v2/post/publish/inbox/video/init/"
+        body = {"source_info": source_info}
+
+    init = requests.post(init_url, headers=headers, json=body, timeout=60)
+    ij = init.json()
+    if ij.get("error", {}).get("code") not in (None, "ok"):
+        raise RuntimeError(f"tiktok init failed: {str(ij.get('error'))[:200]}")
+    data = ij.get("data") or {}
+    publish_id, upload_url = data.get("publish_id"), data.get("upload_url")
+    if not (publish_id and upload_url):
+        raise RuntimeError(f"tiktok init returned no upload url: {str(ij)[:200]}")
+
+    # Push the bytes
+    with open(tmp_path, "rb") as f:
+        for i in range(total_chunks):
+            start = i * chunk_size
+            end = size - 1 if i == total_chunks - 1 else start + chunk_size - 1
+            f.seek(start)
+            payload = f.read(end - start + 1)
+            up = requests.put(upload_url, data=payload, headers={
+                "Content-Type": "video/mp4",
+                "Content-Length": str(len(payload)),
+                "Content-Range": f"bytes {start}-{end}/{size}",
+            }, timeout=1800)
+            if up.status_code not in (200, 201, 206, 308):
+                raise RuntimeError(f"tiktok chunk {i + 1}/{total_chunks} failed "
+                                   f"{up.status_code}: {up.text[:150]}")
+
+    # TikTok processes asynchronously; poll so a failure surfaces in the app, not silently.
+    final_state = "PROCESSING"
+    for _ in range(40):  # ~3.5 min
+        time.sleep(5)
+        st = requests.post("https://open.tiktokapis.com/v2/post/publish/status/fetch/",
+                           headers=headers, json={"publish_id": publish_id}, timeout=30).json()
+        final_state = (st.get("data") or {}).get("status") or final_state
+        if final_state in ("PUBLISH_COMPLETE", "SEND_TO_USER_INBOX"):
+            break
+        if final_state == "FAILED":
+            reason = (st.get("data") or {}).get("fail_reason") or st.get("error")
+            raise RuntimeError(f"tiktok processing failed: {str(reason)[:200]}")
+
+    note = "" if can_direct_post else "Waiting in your TikTok inbox — open the app and tap publish."
+    return {"status": "posted", "postId": str(publish_id), "error": note,
+            "postedAt": datetime.utcnow().isoformat() + "Z"}
+
+
+# ─── The job that posts one scheduled video everywhere it's meant to go ──────
+
+def _run_publish(req: PublishReelRequest):
+    def status(**kw):
+        if req.post_id:
+            firestore_patch(f"scheduledPosts/{req.post_id}",
+                            {"updatedAt": datetime.utcnow().isoformat() + "Z", **kw})
+
+    media_id = secrets.token_urlsafe(16)
+    tmp_path = os.path.join(tempfile.gettempdir(), f"reel_{media_id}.mp4")
+    platforms = [p for p in (req.platforms or ["instagram"]) if p in ("instagram", "youtube", "tiktok")]
+    if not platforms:
+        platforms = ["instagram"]
+    results: dict = {}
+
+    try:
+        status(status="posting", error="")
+
+        # 1. Credentials. Prefer what the caller passed (the "Post now" button has a live
+        #    browser session); otherwise fetch our own — that's the scheduled path.
+        google_token = req.google_access_token or _google_access_token()
+        doc_id, client_data = (None, {})
+        if req.client_id:
+            doc_id, client_data = _client_doc(req.client_id)
+        ig_token = req.ig_access_token or client_data.get("instagramAccessToken") or ""
+        public_base = req.worker_public_url or WORKER_PUBLIC_URL
+
+        # 2. Download the video from Drive once, then reuse it for every platform.
+        with requests.get(f"https://www.googleapis.com/drive/v3/files/{req.drive_file_id}?alt=media",
+                          headers={"Authorization": f"Bearer {google_token}"},
+                          stream=True, timeout=600) as r:
+            if r.status_code != 200:
+                raise RuntimeError(f"drive download failed {r.status_code}: {r.text[:150]}")
+            with open(tmp_path, "wb") as f:
+                for chunk in r.iter_content(1024 * 1024):
+                    f.write(chunk)
+
+        # 3. Post to each platform independently — one failing must not block the others.
+        for plat in platforms:
+            try:
+                results[plat] = {"status": "posting"}
+                status(results=results)
+                if plat == "instagram":
+                    results[plat] = _publish_instagram(tmp_path, media_id, req.caption or "",
+                                                       ig_token, public_base)
+                elif plat == "youtube":
+                    title = req.youtube_title or _youtube_title_from(req.caption or "", "")
+                    results[plat] = _publish_youtube(tmp_path, title, req.caption or "",
+                                                     req.youtube_privacy, google_token)
+                elif plat == "tiktok":
+                    if not doc_id:
+                        raise RuntimeError("no connected account found for this post")
+                    tt_token, tt_scope = _tiktok_access_token(doc_id, client_data)
+                    results[plat] = _publish_tiktok(tmp_path, req.caption or "",
+                                                    req.tiktok_privacy, tt_token, tt_scope)
+            except Exception as e:
+                results[plat] = {"status": "failed", "error": str(e)[:300]}
+                print(f"[publish-reel] {plat} failed: {e}")
+            status(results=results)
+
+        posted = [p for p in platforms if results.get(p, {}).get("status") == "posted"]
+        failed = [p for p in platforms if results.get(p, {}).get("status") == "failed"]
+        if posted and not failed:
+            overall, err = "posted", ""
+        elif posted and failed:
+            overall, err = "partial", "Didn't post to: " + ", ".join(failed)
+        else:
+            overall, err = "failed", "; ".join(
+                f"{p}: {results.get(p, {}).get('error', '?')}" for p in failed)[:300]
+        status(status=overall, error=err, results=results,
+               postedAt=datetime.utcnow().isoformat() + "Z")
+        # Keep the old single-platform field alive for anything still reading it.
+        ig_id = results.get("instagram", {}).get("postId")
+        if ig_id:
+            status(igMediaId=str(ig_id))
     except Exception as e:
-        status(status="failed", error=str(e)[:300])
+        # Something before the per-platform loop (credentials, Drive download) broke.
+        status(status="failed", error=str(e)[:300], results=results)
         print(f"[publish-reel] error: {e}")
     finally:
         _SERVED_FILES.pop(media_id, None)
@@ -770,6 +1097,130 @@ def publish_reel(req: PublishReelRequest, background_tasks: BackgroundTasks, x_w
         raise HTTPException(status_code=401, detail="unauthorized")
     background_tasks.add_task(_run_publish, req)
     return {"started": True}
+
+
+# ─── The clock ───────────────────────────────────────────────────────────────
+# Turns the queue into an actual scheduler: every minute, look for posts whose time
+# has come and publish them. Runs in a daemon thread, same as the IG token refresher,
+# so there's no external cron to pay for or forget about.
+
+MAX_PUBLISH_ATTEMPTS = 3
+
+# A post whose time passed long ago must NOT quietly go live now. Before the clock existed
+# the queue just sat there, so there is a backlog of "scheduled" posts with times in the
+# past — switching the clock on would otherwise publish all of them at once. Anything more
+# than this many hours overdue is marked missed and waits for a human to hit retry.
+MISSED_POST_GRACE_HOURS = 2
+
+# One run at a time. Uploads take minutes, and the manual /run-scheduler trigger must not
+# start a second pass over posts the loop thread is already working through.
+_SCHEDULER_LOCK = __import__("threading").Lock()
+
+
+def _due_scheduled_posts() -> list:
+    """Posts that are queued and whose time has passed."""
+    url = f"https://firestore.googleapis.com/v1/projects/{FIREBASE_PROJECT_ID}/databases/(default)/documents:runQuery"
+    body = {"structuredQuery": {
+        "from": [{"collectionId": "scheduledPosts"}],
+        "where": {"fieldFilter": {"field": {"fieldPath": "status"},
+                                  "op": "EQUAL", "value": {"stringValue": "scheduled"}}}}}
+    rows = requests.post(url, json=body, timeout=30).json()
+    now = datetime.utcnow().isoformat() + "Z"
+    due = []
+    for row in rows if isinstance(rows, list) else []:
+        doc = row.get("document")
+        if not doc:
+            continue
+        data = parse_fs_doc(doc)
+        # Compared as ISO strings — both are UTC with a Z suffix, so this sorts correctly
+        # and avoids a composite Firestore index just to filter on time.
+        if (data.get("scheduledFor") or "") <= now:
+            data["_id"] = doc["name"].split("/")[-1]
+            due.append(data)
+    return due
+
+
+def _run_scheduler_once() -> dict:
+    if not _SCHEDULER_LOCK.acquire(blocking=False):
+        return {"due": 0, "fired": 0, "skipped": "already running"}
+    try:
+        return _scheduler_pass()
+    finally:
+        _SCHEDULER_LOCK.release()
+
+
+def _scheduler_pass() -> dict:
+    due = _due_scheduled_posts()
+    cutoff = (datetime.utcnow() - timedelta(hours=MISSED_POST_GRACE_HOURS)).isoformat() + "Z"
+    fired, missed = 0, 0
+    for post in due:
+        post_id = post["_id"]
+
+        if (post.get("scheduledFor") or "") < cutoff:
+            firestore_patch(f"scheduledPosts/{post_id}", {
+                "status": "failed",
+                "error": "Missed its slot — it was more than "
+                         f"{MISSED_POST_GRACE_HOURS}h overdue, so it wasn't posted automatically. "
+                         "Hit retry to post it now.",
+            })
+            missed += 1
+            continue
+
+        attempts = int(post.get("attempts") or 0)
+        if attempts >= MAX_PUBLISH_ATTEMPTS:
+            firestore_patch(f"scheduledPosts/{post_id}", {
+                "status": "failed",
+                "error": f"Gave up after {attempts} tries — check the connection and retry it.",
+            })
+            continue
+        # Claim it first: flipping the status out of "scheduled" means the next tick
+        # won't pick up the same post while this one is still uploading.
+        firestore_patch(f"scheduledPosts/{post_id}", {"status": "posting", "attempts": attempts + 1})
+        try:
+            _run_publish(PublishReelRequest(
+                post_id=post_id,
+                drive_file_id=post.get("driveFileId", ""),
+                caption=post.get("caption", ""),
+                client_id=post.get("clientId"),
+                platforms=post.get("platforms") or ["instagram"],
+                youtube_title=post.get("youtubeTitle"),
+                youtube_privacy=post.get("youtubePrivacy") or "private",
+                tiktok_privacy=post.get("tiktokPrivacy") or "SELF_ONLY",
+            ))
+            fired += 1
+        except Exception as e:
+            firestore_patch(f"scheduledPosts/{post_id}", {"status": "failed", "error": str(e)[:300]})
+            print(f"[scheduler] {post_id} failed: {e}")
+    return {"due": len(due), "fired": fired, "missed": missed}
+
+
+@app.post("/run-scheduler")
+def run_scheduler(x_worker_secret: str = Header(default="")):
+    """Manual trigger for the clock (it also runs by itself every minute)."""
+    if x_worker_secret != WORKER_SECRET:
+        raise HTTPException(status_code=401, detail="unauthorized")
+    return _run_scheduler_once()
+
+
+def _scheduler_loop():
+    time.sleep(45)  # let the app finish booting
+    while True:
+        try:
+            summary = _run_scheduler_once()
+            if summary["due"]:
+                print(f"[scheduler] {summary['fired']}/{summary['due']} due posts fired")
+        except Exception as e:
+            print(f"[scheduler] loop error: {e}")
+        time.sleep(60)
+
+
+@app.on_event("startup")
+def _start_scheduler():
+    if not SCHEDULER_ENABLED:
+        print("[scheduler] disabled via SCHEDULER_ENABLED=0")
+        return
+    import threading
+    threading.Thread(target=_scheduler_loop, daemon=True).start()
 
 
 class BuildReelClip(BaseModel):
