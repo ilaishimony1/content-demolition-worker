@@ -622,6 +622,19 @@ def push_to_drive(req: PushRequest, background_tasks: BackgroundTasks):
     return {"started": True, "to_move": len(req.moves)}
 
 
+# Meta reuses type "OAuthException" for rate limits, so the type alone proves nothing.
+# These codes are the ones that fix themselves; everything else is treated as a dead
+# credential, because a broken connection must never go on looking healthy.
+_IG_TRANSIENT_CODES = {1, 2, 4, 17, 32, 341, 613}
+
+
+def _is_ig_auth_error(payload: dict) -> bool:
+    """False only for failures that resolve on their own. Flagging a rate limit or a Meta
+    5xx as 'reconnect me' takes an account offline for days over a hiccup."""
+    err = (payload or {}).get("error") or {}
+    return err.get("code") not in _IG_TRANSIENT_CODES
+
+
 def _refresh_ig_tokens_core():
     """Keep every connected Instagram account ALIVE so clients connect ONCE and never have
     to reconnect. IG long-lived tokens last 60 days but can be refreshed for another 60 while
@@ -649,10 +662,15 @@ def _refresh_ig_tokens_core():
             rj = rr.json()
             new_token = rj.get("access_token")
             if not new_token:
-                # Token likely already expired → account needs a manual reconnect
-                firestore_patch(f"users/{doc_id}", {"instagramTokenError": str(rj)[:250]})
+                # Only a genuine auth failure means "reconnect me". Flagging a rate limit or a
+                # Meta 5xx here would block the account's posting until a human reconnects it,
+                # for a blip that fixes itself by the next pass.
                 failed += 1
                 results.append({"username": username, "ok": False, "error": str(rj)[:150]})
+                if _is_ig_auth_error(rj):
+                    firestore_patch(f"users/{doc_id}", {"instagramTokenError": str(rj)[:250]})
+                else:
+                    print(f"[ig-refresh] transient error for {username}, not flagging: {str(rj)[:150]}")
                 continue
             fields = {"instagramAccessToken": new_token,
                       "instagramConnectedAt": datetime.utcnow().isoformat() + "Z",
