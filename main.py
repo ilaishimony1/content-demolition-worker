@@ -625,13 +625,15 @@ def push_to_drive(req: PushRequest, background_tasks: BackgroundTasks):
 # Meta reuses type "OAuthException" for rate limits, so the type alone proves nothing.
 # These codes are the ones that fix themselves; everything else is treated as a dead
 # credential, because a broken connection must never go on looking healthy.
-_IG_TRANSIENT_CODES = {1, 2, 4, 17, 32, 341, 613}
+_IG_TRANSIENT_CODES = {1, 2, 4, 17, 32, 341, 368, 613} | set(range(80001, 80008))
 
 
 def _is_ig_auth_error(payload: dict) -> bool:
     """False only for failures that resolve on their own. Flagging a rate limit or a Meta
     5xx as 'reconnect me' takes an account offline for days over a hiccup."""
-    err = (payload or {}).get("error") or {}
+    err = (payload or {}).get("error")
+    if not isinstance(err, dict):
+        return True
     return err.get("code") not in _IG_TRANSIENT_CODES
 
 
