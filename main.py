@@ -28,6 +28,12 @@ ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 FIREBASE_PROJECT_ID = os.environ.get("FIREBASE_PROJECT_ID", "")
 WORKER_SECRET = os.environ.get("WORKER_SECRET", "demolition-secret")
 
+# The web app's public URL. The worker pings it to run the Drive sync on a timer, so the
+# library stays current without anyone opening a browser tab.
+APP_URL = os.environ.get("APP_URL", "")
+AUTO_SYNC_MINUTES = int(os.environ.get("AUTO_SYNC_MINUTES", "15"))
+AUTO_SYNC_ENABLED = os.environ.get("AUTO_SYNC_ENABLED", "1") not in ("0", "false", "False")
+
 claude = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
 # ─── Firestore helpers ────────────────────────────────────────────────────────
@@ -1290,3 +1296,58 @@ def triage_podcast(req: TriagePodcastRequest, background_tasks: BackgroundTasks)
     Frontend polls triageStatus/{episode_id}; result lands in podcastTriage/{episode_id}."""
     background_tasks.add_task(_run_triage_podcast, req.episode_id)
     return {"started": True, "episode_id": req.episode_id}
+
+
+# ─── Drive auto-sync ticker ──────────────────────────────────────────────────
+# The library used to refresh ONLY inside a browser tab belonging to someone who had
+# personally signed in with Google. If that person wasn't looking, files went stale, and
+# a teammate just saw an out-of-date library with no explanation. This ticker asks the web
+# app to sync every client's Drive folder on a schedule instead — the app holds its own
+# Drive key, so nobody has to be at a computer.
+
+def _run_drive_sync_once() -> dict:
+    if not APP_URL:
+        return {"skipped": "APP_URL not set"}
+    r = requests.post(
+        f"{APP_URL.rstrip('/')}/api/drive-sync-all",
+        headers={"x-worker-secret": WORKER_SECRET},
+        timeout=600,
+    )
+    try:
+        return r.json()
+    except Exception:
+        return {"error": f"http {r.status_code}: {r.text[:200]}"}
+
+
+@app.post("/run-drive-sync")
+def run_drive_sync(x_worker_secret: str = Header(default="")):
+    """Manual trigger for the Drive sync (it also runs by itself on a timer)."""
+    if x_worker_secret != WORKER_SECRET:
+        raise HTTPException(status_code=401, detail="unauthorized")
+    return _run_drive_sync_once()
+
+
+def _drive_sync_loop():
+    time.sleep(90)  # let the app and the worker finish booting
+    while True:
+        try:
+            summary = _run_drive_sync_once()
+            if summary.get("error") or summary.get("needsGoogle"):
+                print(f"[drive-sync] {summary}")
+            else:
+                print(f"[drive-sync] synced {summary.get('clients', 0)} clients")
+        except Exception as e:
+            print(f"[drive-sync] loop error: {e}")
+        time.sleep(max(60, AUTO_SYNC_MINUTES * 60))
+
+
+@app.on_event("startup")
+def _start_drive_sync():
+    if not AUTO_SYNC_ENABLED:
+        print("[drive-sync] disabled via AUTO_SYNC_ENABLED=0")
+        return
+    if not APP_URL:
+        print("[drive-sync] APP_URL not set — auto-sync is OFF until it is")
+        return
+    import threading
+    threading.Thread(target=_drive_sync_loop, daemon=True).start()
